@@ -84,8 +84,8 @@ static_assert(sizeof(void*) == 8, "the forwarding thunks are x64-specific");
 // Bounded diagnostic log: OutputDebugString plus %TEMP%\d3d12_xs-shim.log, capped by message count
 // and file size. Only IIDs, slot numbers and pointers are written.
 // ---------------------------------------------------------------------------------------------
-constexpr LONG max_log_messages = 256;
-constexpr LONGLONG max_log_file_bytes = 64 * 1024;
+constexpr LONG max_log_messages = 16384;
+constexpr LONGLONG max_log_file_bytes = 4 * 1024 * 1024;
 volatile LONG log_message_count = 0;
 SRWLOCK log_lock = SRWLOCK_INIT;
 
@@ -299,6 +299,7 @@ struct XsCommandListProxy {
     void** vtable;             // +0  COM vtable pointer seen by the caller.
     volatile LONG references;  // +8  proxy IUnknown reference count.
     void* real_list;           // +16 owned desktop ID3D12GraphicsCommandList.
+    ProxyDevice* device_proxy; // +24 owning device proxy returned by GetDevice.
     void* thunk_memory;        // executable thunk block.
     void** vtable_memory;      // backing storage for `vtable`.
 };
@@ -339,6 +340,12 @@ HRESULT WINAPI command_list_query_interface(XsCommandListProxy* proxy, REFIID ii
     return S_OK;
 }
 
+HRESULT WINAPI command_list_get_device(XsCommandListProxy* proxy, REFIID iid, void** out)
+{
+    if (!proxy || !proxy->device_proxy) return E_FAIL;
+    return proxy_query_interface(proxy->device_proxy, iid, out);
+}
+
 // Tail-called by a command-list stub. RDX holds the slot number (overwriting the original second
 // argument is safe for these unforwarded slots); RCX is the caller's `this`, or for a hidden
 // return buffer method the buffer itself. The buffer is never dereferenced.
@@ -375,7 +382,7 @@ HRESULT create_real_command_list(ID3D12Device* device, UINT node_mask, D3D12_COM
                                      __uuidof(ID3D12GraphicsCommandList), out);
 }
 
-XsCommandListProxy* create_command_list_proxy(void* real_list)
+XsCommandListProxy* create_command_list_proxy(void* real_list, ProxyDevice* device_proxy)
 {
     auto* proxy = new (std::nothrow) XsCommandListProxy{};
     if (!proxy) return nullptr;
@@ -407,6 +414,7 @@ XsCommandListProxy* create_command_list_proxy(void* real_list)
             static_cast<std::uint32_t>(slot), false);
         proxy->vtable_memory[slot] = thunk;
     }
+    proxy->vtable_memory[7] = reinterpret_cast<void*>(&command_list_get_device);
     for (std::size_t slot = command_list_stub_first; slot < command_list_vtable_slots; ++slot) {
         void* stub = cursor;
         cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&command_list_unimplemented));
@@ -432,6 +440,7 @@ XsCommandListProxy* create_command_list_proxy(void* real_list)
 
     proxy->thunk_memory = code;
     proxy->real_list = real_list;
+    proxy->device_proxy = device_proxy;
     proxy->references = 1; // the caller's reference; one proxy per CreateCommandListX call
     return proxy;
 }
@@ -465,7 +474,7 @@ HRESULT WINAPI create_xbox_command_list(ProxyDevice* proxy, const XboxCommandLis
         return FAILED(create_hr) ? create_hr : E_FAIL;
     }
 
-    XsCommandListProxy* list_proxy = create_command_list_proxy(real_list);
+    XsCommandListProxy* list_proxy = create_command_list_proxy(real_list, proxy);
     if (!list_proxy) {
         static_cast<ID3D12GraphicsCommandList*>(real_list)->Release();
         write_log("d3d12_xs: command-list proxy allocation failed -> E_OUTOFMEMORY\n");
@@ -495,6 +504,9 @@ HRESULT WINAPI create_xbox_command_list(ProxyDevice* proxy, const XboxCommandLis
 // Observed title call at 0x2478de4: Xbox device slot 0x278 (79) with scalar arguments and no out
 // pointer, HRESULT checked only for >= 0. This is a desktop-safe no-op until the Xbox method is
 // measured; it is likely a frame/interval configuration call.
+constexpr std::size_t slot78_slot = 78;
+HRESULT WINAPI slot78_noop(ProxyDevice*) { return S_OK; }
+
 constexpr std::size_t set_frame_interval_x_slot = 79;
 
 HRESULT WINAPI set_frame_interval_x(ProxyDevice* proxy, std::uint32_t interval, std::uintptr_t,
@@ -610,8 +622,6 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
 
 constexpr std::size_t create_descriptor_heap_slot = 14;
 constexpr UINT desktop_shader_visible_limit = 1'000'000;
-constexpr std::uintptr_t descriptor_pool_base_rva = 0x75DF188;
-constexpr std::uintptr_t descriptor_pool_size_rva = 0x75DF190;
 
 HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                       REFIID iid, void** heap)
@@ -635,23 +645,12 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
         write_log(line);
         return FAILED(result) ? result : E_FAIL;
     }
-    const auto cpu = real_heap->GetCPUDescriptorHandleForHeapStart();
     if (clamp) {
-        if (HMODULE game = GetModuleHandleW(nullptr)) {
-            auto* base_slot = reinterpret_cast<std::uintptr_t*>(
-                reinterpret_cast<unsigned char*>(game) + descriptor_pool_base_rva);
-            *base_slot = cpu.ptr;
-            const UINT increment = proxy->real->GetDescriptorHandleIncrementSize(copy.Type);
-            auto* size_slot = reinterpret_cast<std::uintptr_t*>(
-                reinterpret_cast<unsigned char*>(game) + descriptor_pool_size_rva);
-            *size_slot = static_cast<std::uintptr_t>(copy.NumDescriptors) * increment;
-        }
         char line[192];
         std::snprintf(line, sizeof(line),
-                      "d3d12_xs: clamped descriptor heap %u -> %u cpu=0x%llx\n",
+                      "d3d12_xs: clamped descriptor heap %u -> %u\n",
                       static_cast<unsigned>(desc->NumDescriptors),
-                      static_cast<unsigned>(copy.NumDescriptors),
-                      static_cast<unsigned long long>(cpu.ptr));
+                      static_cast<unsigned>(copy.NumDescriptors));
         write_log(line);
     }
     DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap);
@@ -690,6 +689,91 @@ HRESULT WINAPI create_command_queue_x(ProxyDevice* proxy, const void* desc, REFI
 }
 
 // Adopts the caller's reference on `real`; returns nullptr without touching it on failure.
+// Measured Xbox committed-resource creation at 0x193e1b4 (device slot 127 / 0x3f8). The console
+// entry inserts three extra arguments after the desktop clear value, then supplies IID and out.
+// RCX=proxy, RDX=heap properties, R8D=heap flags, R9=resource desc, stack: initial state, clear
+// value, three console-only args, REFIID, out. Translate to desktop CreateCommittedResource.
+constexpr std::size_t create_committed_resource_x_slot = 127;
+
+HRESULT WINAPI create_committed_resource_x(
+    ProxyDevice* proxy, const D3D12_HEAP_PROPERTIES* heap_properties, D3D12_HEAP_FLAGS heap_flags,
+    const D3D12_RESOURCE_DESC* resource_desc, D3D12_RESOURCE_STATES initial_state,
+    const D3D12_CLEAR_VALUE* clear_value, std::uintptr_t, std::uintptr_t, std::uintptr_t,
+    REFIID iid, void** resource)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!heap_properties || !resource_desc || !resource) return E_INVALIDARG;
+    *resource = nullptr;
+    D3D12_RESOURCE_DESC safe_desc = *resource_desc;
+    constexpr D3D12_RESOURCE_FLAGS allowed_flags =
+        static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                          D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                          D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+    safe_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(safe_desc.Flags & allowed_flags);
+    const HRESULT result = proxy->real->CreateCommittedResource(
+        heap_properties, D3D12_HEAP_FLAG_NONE, &safe_desc, D3D12_RESOURCE_STATE_COMMON,
+        clear_value, iid, resource);
+    if (FAILED(result)) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateCommittedResourceX dim=%u w=%llu h=%u flags=%u -> "
+                      "0x%08lx\n",
+                      static_cast<unsigned>(safe_desc.Dimension),
+                      static_cast<unsigned long long>(safe_desc.Width),
+                      static_cast<unsigned>(safe_desc.Height),
+                      static_cast<unsigned>(heap_flags), static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
+
+// Desktop slot 62 is ID3D12Device5::CreateStateObject. The bundled BVH builder reached this slot
+// through the device proxy and threw E_NOTIMPL when the generic Xbox stub answered. DXR is available
+// on the real device (tier 12), so forward the state-object request.
+constexpr std::size_t create_state_object_slot = 62;
+
+HRESULT WINAPI create_state_object(ProxyDevice* proxy, const D3D12_STATE_OBJECT_DESC* desc,
+                                   REFIID iid, void** state_object)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!state_object) return E_POINTER;
+    *state_object = nullptr;
+    ID3D12Device5* device5 = nullptr;
+    HRESULT result = proxy->real->QueryInterface(
+        __uuidof(ID3D12Device5), reinterpret_cast<void**>(&device5));
+    if (SUCCEEDED(result) && device5) {
+        result = device5->CreateStateObject(desc, iid, state_object);
+        device5->Release();
+    }
+    char line[192];
+    std::snprintf(line, sizeof(line),
+                  "d3d12_xs: CreateStateObject type=%u subobjects=%u -> 0x%08lx\n",
+                  desc ? static_cast<unsigned>(desc->Type) : 0u,
+                  desc ? static_cast<unsigned>(desc->NumSubobjects) : 0u,
+                  static_cast<unsigned long>(result));
+    write_log(line);
+    return result;
+}
+
+// Observed Xbox view creation at device slot 70 (0x230): RDX = CPU handle pointer,
+// R8 = D3D12_SHADER_RESOURCE_VIEW_DESC*, R9 = ID3D12Resource*. Translate to desktop slot 18.
+constexpr std::size_t create_shader_resource_view_x_slot = 70;
+
+HRESULT WINAPI create_shader_resource_view_x(ProxyDevice* proxy,
+                                             const D3D12_CPU_DESCRIPTOR_HANDLE* handle,
+                                             const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                             ID3D12Resource* resource)
+{
+    (void)proxy;
+    (void)handle;
+    (void)desc;
+    (void)resource;
+    // Console slot 70 carries a console descriptor/format payload, not the desktop SRV ABI.
+    // Reporting success avoids the BVH builder's fatal E_NOTIMPL throw; the view is not emitted.
+    return S_OK;
+}
+
 ProxyDevice* create_proxy(ID3D12Device* real)
 {
     auto* proxy = new (std::nothrow) ProxyDevice{};
@@ -734,10 +818,17 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_descriptor_heap);
     proxy->vtable_memory[create_xbox_slot73_index] =
         reinterpret_cast<void*>(&create_xbox_command_list);
+    proxy->vtable_memory[slot78_slot] = reinterpret_cast<void*>(&slot78_noop);
     proxy->vtable_memory[set_frame_interval_x_slot] =
         reinterpret_cast<void*>(&set_frame_interval_x);
     proxy->vtable_memory[configure_frame_event_slot] =
         reinterpret_cast<void*>(&configure_frame_event);
+    proxy->vtable_memory[create_committed_resource_x_slot] =
+        reinterpret_cast<void*>(&create_committed_resource_x);
+    proxy->vtable_memory[create_state_object_slot] =
+        reinterpret_cast<void*>(&create_state_object);
+    proxy->vtable_memory[create_shader_resource_view_x_slot] =
+        reinterpret_cast<void*>(&create_shader_resource_view_x);
 
     if (cursor != code + thunk_block_bytes) {
         VirtualFree(code, 0, MEM_RELEASE);
@@ -833,6 +924,15 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
         write_log(line);
         return FAILED(create_hr) ? create_hr : E_FAIL;
     }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    const HRESULT feature_hr = real_device->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
+    std::snprintf(line, sizeof(line),
+                  "d3d12_xs: device raytracing tier=%u feature_hr=0x%08lx\n",
+                  static_cast<unsigned>(options5.RaytracingTier),
+                  static_cast<unsigned long>(feature_hr));
+    write_log(line);
 
     ProxyDevice* proxy = create_proxy(real_device);
     if (!proxy) {
