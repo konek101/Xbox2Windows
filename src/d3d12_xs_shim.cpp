@@ -311,6 +311,7 @@ constexpr std::size_t command_list_thunk_block_bytes =
 constexpr std::size_t command_list_set_pipeline_state_slot = 25;
 constexpr std::size_t command_list_set_compute_root_signature_slot = 29;
 constexpr std::size_t command_list_set_compute_root_uav_slot = 41;
+constexpr std::size_t command_list_set_root_constants_slot = 40;
 static_assert(command_list_set_pipeline_state_slot >= command_list_forward_first &&
                   command_list_set_pipeline_state_slot <= command_list_forward_last,
               "SetPipelineState must be inside the forwarded range");
@@ -335,6 +336,7 @@ struct XsCommandListProxy {
     void* thunk_memory;        // executable thunk block.
     void** vtable_memory;      // backing storage for `vtable`.
     bool replacement_active;   // the replacement root signature is currently bound.
+    bool logged_root_constants; // diagnostic: first root-constant payload has been logged.
     ID3D12RootSignature* requested_root_signature; // last non-replacement root signature.
 };
 
@@ -492,6 +494,35 @@ void WINAPI command_list_set_compute_root_uav(XsCommandListProxy* proxy, UINT ro
     }
 }
 
+// Slot 40: SetComputeRoot32BitConstants. Forwarded unchanged, but the first call per list logs the
+// payload so the console BVH base address carried in the L1 constant block is observable. This is
+// diagnostic only and does not alter the constants.
+void WINAPI command_list_set_root_constants(XsCommandListProxy* proxy, UINT root_parameter_index,
+                                            UINT count, const void* data, UINT dest_offset)
+{
+    if (!proxy || !proxy->real_list) return;
+    auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
+    if (data && count && !proxy->logged_root_constants) {
+        proxy->logged_root_constants = true;
+        const auto* words = static_cast<const std::uint32_t*>(data);
+        const UINT shown = count < 8 ? count : 8;
+        char line[256];
+        int used = std::snprintf(line, sizeof(line),
+                                 "d3d12_xs: root constants param=%u count=%u offset=%u first=",
+                                 static_cast<unsigned>(root_parameter_index), static_cast<unsigned>(count),
+                                 static_cast<unsigned>(dest_offset));
+        for (UINT index = 0; index < shown && used > 0 && static_cast<std::size_t>(used) < sizeof(line);
+             ++index) {
+            used += std::snprintf(line + used, sizeof(line) - static_cast<std::size_t>(used),
+                                  "%08x ", words[index]);
+            if (used < 0) break;
+        }
+        write_log(line);
+        write_log("\n");
+    }
+    real->SetComputeRoot32BitConstants(root_parameter_index, count, data, dest_offset);
+}
+
 // Prefer the newest desktop list interface the SDK exposes, then fall back to the base one.
 HRESULT create_real_command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                  ID3D12CommandAllocator* allocator,
@@ -546,6 +577,8 @@ XsCommandListProxy* create_command_list_proxy(void* real_list, ProxyDevice* devi
         reinterpret_cast<void*>(&command_list_set_compute_root_signature);
     proxy->vtable_memory[command_list_set_compute_root_uav_slot] =
         reinterpret_cast<void*>(&command_list_set_compute_root_uav);
+    proxy->vtable_memory[command_list_set_root_constants_slot] =
+        reinterpret_cast<void*>(&command_list_set_root_constants);
     for (std::size_t slot = command_list_stub_first; slot < command_list_vtable_slots; ++slot) {
         void* stub = cursor;
         cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&command_list_unimplemented));
@@ -1358,8 +1391,13 @@ HRESULT WINAPI create_compute_pipeline_state_x(
     }
 
     char line[192];
-    std::snprintf(line, sizeof(line), "d3d12_xs: compute PSO src=%s -> 0x%08lx\n", source,
-                  static_cast<unsigned long>(result));
+    const std::uint64_t incoming_hash =
+        desc->CS.pShaderBytecode ? fnv1a64(desc->CS.pShaderBytecode, desc->CS.BytecodeLength) : 0ull;
+    std::snprintf(line, sizeof(line),
+                  "d3d12_xs: compute PSO src=%s -> 0x%08lx (cs=%llu fnv=0x%016llx match=%d)\n", source,
+                  static_cast<unsigned long>(result),
+                  static_cast<unsigned long long>(desc->CS.BytecodeLength),
+                  static_cast<unsigned long long>(incoming_hash), replacement_target ? 1 : 0);
     write_log(line);
     return result;
 }
