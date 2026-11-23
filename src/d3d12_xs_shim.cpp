@@ -172,14 +172,17 @@ HRESULT WINAPI proxy_query_interface(ProxyDevice* proxy, REFIID iid, void** out)
 // Tail-called by an Xbox appended-slot stub. RDX holds the slot number (overwriting the original
 // second argument is safe because the slot is unimplemented); RCX still holds whatever the caller
 // passed there, which for sret methods is the hidden return buffer. Do not dereference it.
+// Console device slots from #44 upward are the Xbox extensions. The public XCL reference records that
+// unimplemented extension slots answer S_OK rather than an error, so a title probing a capability is
+// not pushed onto an error path. Slots with a measured meaning keep their dedicated handlers.
 HRESULT WINAPI unimplemented_xbox_slot(ProxyDevice* self, std::uintptr_t slot)
 {
     char line[192];
     std::snprintf(line, sizeof(line),
-                  "d3d12_xs: xbox vtable slot %llu called (this=%p) -> E_NOTIMPL\n",
+                  "d3d12_xs: xbox vtable slot %llu called (this=%p) -> S_OK (stub)\n",
                   static_cast<unsigned long long>(slot), static_cast<void*>(self));
     write_log(line);
-    return E_NOTIMPL;
+    return S_OK;
 }
 
 void put_u32(std::uint8_t*& cursor, std::uint32_t value)
