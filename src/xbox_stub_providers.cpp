@@ -81,7 +81,10 @@ struct inert_object {
     volatile LONG references;
 };
 
-std::int32_t WINAPI inert_method(void*) { return 0; }
+// Methods that write through an out-parameter must not report success without filling it: the
+// caller would consume whatever stale pointer the slot held. Fail closed instead so the title takes
+// its error path rather than dereferencing garbage.
+std::int32_t WINAPI inert_method(void*) { return not_implemented; }
 std::uint32_t WINAPI inert_add_ref(inert_object* self)
 {
     return static_cast<std::uint32_t>(InterlockedIncrement(&self->references));
