@@ -42,8 +42,8 @@ static_assert(offsetof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC, Desc_1_1) +
 //   * Slots 44..139 are reserved for the Xbox-appended methods whose layout is not known yet.
 //     Every one of them lands on a generated stub that logs the slot number and returns
 //     E_NOTIMPL. Nothing in that range is ever executed as code from the proxy or the caller.
-//   * Slot 73 (offset 0x248), measured in the title, is the exception: it returns a bring-up fake
-//     object instead of E_NOTIMPL. See the slot-73 section below.
+//   * Slot 73 (offset 0x248), measured in the title, is the exception: it creates a real desktop
+//     command list and returns a forwarding proxy over it. See the command-list section below.
 //
 // This is deliberately a prefix-compatible assumption: the Xbox interface is treated as
 // ID3D12Device followed by appended methods. `desktop_device_slots` and `xbox_appended_slots`
@@ -229,148 +229,266 @@ std::uint8_t* emit_xbox_stub(std::uint8_t* code, std::uintptr_t slot, const void
 }
 
 // ---------------------------------------------------------------------------------------------
-// Slot-73 bring-up fake object.
+// Slot-73 command-list proxy.
 //
-// The observed title calls Xbox device vtable slot 73 (offset 0x248) and treats a negative HRESULT
-// as fatal. The real Xbox method and the object it returns are not documented here, so this returns
-// a process-wide singleton that is deliberately a no-op. It is NOT console-accurate.
+// The observed title calls Xbox device vtable slot 73 (offset 0x248), CreateCommandListX, at game
+// RVA 0x2478b71:
+//   RCX = device proxy
+//   RDX = 16-byte console descriptor {type, flags, nodeMask, ...}
+//   R8  = allocator returned by device slot 9
+//   R9  = initial PSO (0 in the observed call)
+//   [rsp+0x28] = REFIID {c3827890-4024-474c-98cf-645b51dc4874}
+//   [rsp+0x30] = void** out
 //
-//   * Slots 0..2 implement QueryInterface/AddRef/Release.
-//   * Every other slot (3..255) is a generated x64 stub that loads the slot number into RDX and
-//     tail-calls one common handler, which logs the slot and returns S_OK. That covers the
-//     [object_vtable + 0x420] (slot 132) call the observed caller makes on the result, so no slot
-//     can ever return E_NOTIMPL.
+// The desktop method has no console descriptor, so the type and node mask are translated and a
+// normal desktop list is created with ID3D12Device::CreateCommandList. The returned object is a
+// per-call proxy:
 //
-// The stub clobbers RDX with the slot number. That is safe because the handler ignores method
-// arguments. For a hidden-return-buffer (sret) method RCX is the caller's return buffer rather than
-// `this`; the handler logs it as an opaque pointer and never dereferences it, and such methods
-// return S_OK without filling the buffer. That remains an uncertainty.
+//   * Slots 0..2 implement QueryInterface/AddRef/Release. QueryInterface answers the console
+//     command-list IID, IID_ID3D12GraphicsCommandList6 (when the SDK declares it),
+//     IID_ID3D12GraphicsCommandList and IUnknown.
+//   * Slots 3..27 are the fixed base ID3D12GraphicsCommandList methods (3 IUnknown + 4
+//     ID3D12Object + 1 ID3D12DeviceChild + 1 ID3D12CommandList + 18 ID3D12GraphicsCommandList),
+//     including slot 9 Close. Each slot is a generated x64 thunk that swaps the proxy `this` for
+//     the real desktop list and tail-jumps to the same desktop vtable slot.
+//   * Slots 28..255 are console reordering / unknown methods. Their stubs log the slot and return
+//     E_NOTIMPL, except the measured tail calls slot 131 (0x418) and slot 132 (0x420), which have
+//     no out parameter and whose return values are ignored: those log and return S_OK.
+//
+// The real list is released when the proxy refcount reaches zero. One proxy is created per
+// CreateCommandListX call; nothing here is a singleton.
 // ---------------------------------------------------------------------------------------------
 constexpr std::size_t create_xbox_slot73_index = 73;
-constexpr std::size_t fake_slot73_vtable_slots = 256;
-constexpr std::size_t fake_slot73_stub_count = fake_slot73_vtable_slots - 3;
-constexpr std::size_t fake_slot73_stub_block_bytes = xbox_stub_bytes * fake_slot73_stub_count;
-constexpr std::size_t fake_slot73_observed_result_method = 0x420 / sizeof(void*);
 static_assert(create_xbox_slot73_index >= desktop_device_slots &&
                   create_xbox_slot73_index < proxy_vtable_slots,
               "slot 73 must be an Xbox-appended slot of the device proxy");
-static_assert(fake_slot73_vtable_slots > fake_slot73_observed_result_method,
-              "the fake object vtable must cover [vtable+0x420]");
 
-struct FakeSlot73Object {
-    void** vtable;            // +0  COM vtable pointer seen by the caller.
-    volatile LONG references; // +8  singleton IUnknown reference count.
+// Console command-list IID requested by the observed CreateCommandListX call.
+constexpr GUID xbox_command_list_iid = {0xc3827890u, 0x4024u, 0x474cu,
+                                        {0x98u, 0xcfu, 0x64u, 0x5bu,
+                                         0x51u, 0xdcu, 0x48u, 0x74u}};
+
+// Observed 16-byte console descriptor: {type, flags, nodeMask, reserved}.
+struct XboxCommandListDesc {
+    std::uint32_t type;      // +0
+    std::uint32_t flags;     // +4
+    std::uint32_t node_mask; // +8
+    std::uint32_t reserved;  // +12
+};
+static_assert(sizeof(XboxCommandListDesc) == 16, "the console descriptor is 16 bytes");
+static_assert(offsetof(XboxCommandListDesc, node_mask) == 8, "nodeMask is at +8");
+
+constexpr std::size_t command_list_vtable_slots = 256;
+constexpr std::size_t command_list_forward_first = 3;
+constexpr std::size_t command_list_forward_last = 27;
+constexpr std::size_t command_list_stub_first = command_list_forward_last + 1;
+constexpr std::size_t command_list_forward_count =
+    command_list_forward_last - command_list_forward_first + 1;
+constexpr std::size_t command_list_stub_count =
+    command_list_vtable_slots - command_list_stub_first;
+constexpr std::size_t command_list_thunk_block_bytes =
+    forward_thunk_bytes * command_list_forward_count + xbox_stub_bytes * command_list_stub_count;
+constexpr std::size_t command_list_tail_slot_131 = 0x418 / sizeof(void*);
+constexpr std::size_t command_list_tail_slot_132 = 0x420 / sizeof(void*);
+static_assert(command_list_tail_slot_131 == 131, "0x418 is slot 131");
+static_assert(command_list_tail_slot_132 == 132, "0x420 is slot 132");
+static_assert(command_list_vtable_slots > command_list_tail_slot_132,
+              "the command-list vtable must cover [vtable+0x420]");
+
+struct XsCommandListProxy {
+    void** vtable;             // +0  COM vtable pointer seen by the caller.
+    volatile LONG references;  // +8  proxy IUnknown reference count.
+    void* real_list;           // +16 owned desktop ID3D12GraphicsCommandList.
+    void* thunk_memory;        // executable thunk block.
+    void** vtable_memory;      // backing storage for `vtable`.
 };
 
-void* fake_slot73_vtable[fake_slot73_vtable_slots] = {};
-FakeSlot73Object fake_slot73_object{};
-bool fake_slot73_ready = false;
-INIT_ONCE fake_slot73_init_once = INIT_ONCE_STATIC_INIT;
-
-ULONG WINAPI fake_slot73_add_ref(FakeSlot73Object* self)
+void destroy_command_list_proxy(XsCommandListProxy* proxy)
 {
-    return static_cast<ULONG>(InterlockedIncrement(&self->references));
+    if (proxy->real_list) static_cast<ID3D12GraphicsCommandList*>(proxy->real_list)->Release();
+    if (proxy->thunk_memory) VirtualFree(proxy->thunk_memory, 0, MEM_RELEASE);
+    delete[] proxy->vtable_memory;
+    delete proxy;
 }
 
-// Static singleton lifetime: never destroy. Clamp instead of letting the count wrap.
-ULONG WINAPI fake_slot73_release(FakeSlot73Object* self)
+ULONG WINAPI command_list_add_ref(XsCommandListProxy* proxy)
 {
-    const LONG remaining = InterlockedDecrement(&self->references);
-    if (remaining < 0) {
-        InterlockedExchange(&self->references, 0);
-        return 0;
-    }
+    return static_cast<ULONG>(InterlockedIncrement(&proxy->references));
+}
+
+ULONG WINAPI command_list_release(XsCommandListProxy* proxy)
+{
+    const LONG remaining = InterlockedDecrement(&proxy->references);
+    if (remaining == 0) destroy_command_list_proxy(proxy);
     return static_cast<ULONG>(remaining);
 }
 
-// Choice: answer every IID with the same singleton. The interface the title expects from slot 73 is
-// unknown, and every non-IUnknown method is a safe no-op, so E_NOINTERFACE would only add a failure
-// path. The trade-off is possible type confusion if a caller uses an interface-specific method.
-HRESULT WINAPI fake_slot73_query_interface(FakeSlot73Object* self, REFIID iid, void** out)
+HRESULT WINAPI command_list_query_interface(XsCommandListProxy* proxy, REFIID iid, void** out)
 {
-    (void)iid;
     if (!out) return E_POINTER;
     *out = nullptr;
-    fake_slot73_add_ref(self);
-    *out = self;
+    bool supported = IsEqualIID(iid, __uuidof(IUnknown)) ||
+                     IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList)) ||
+                     IsEqualIID(iid, xbox_command_list_iid);
+#if defined(__ID3D12GraphicsCommandList6_INTERFACE_DEFINED__)
+    supported = supported || IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6));
+#endif
+    if (!supported) return E_NOINTERFACE;
+    command_list_add_ref(proxy);
+    *out = proxy;
     return S_OK;
 }
 
-HRESULT WINAPI fake_slot73_default(FakeSlot73Object* self, std::uintptr_t slot)
+// Tail-called by a command-list stub. RDX holds the slot number (overwriting the original second
+// argument is safe for these unforwarded slots); RCX is the caller's `this`, or for a hidden
+// return buffer method the buffer itself. The buffer is never dereferenced.
+HRESULT WINAPI command_list_unimplemented(XsCommandListProxy* self, std::uintptr_t slot)
 {
+    if (slot == command_list_tail_slot_131 || slot == command_list_tail_slot_132) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: command-list tail slot %llu called (self=%p) -> S_OK\n",
+                      static_cast<unsigned long long>(slot), static_cast<void*>(self));
+        write_log(line);
+        return S_OK;
+    }
     char line[160];
     std::snprintf(line, sizeof(line),
-                  "d3d12_xs: slot-73 fake object method %llu called (self=%p) -> S_OK\n",
+                  "d3d12_xs: xbox command-list slot %llu called (self=%p) -> E_NOTIMPL\n",
                   static_cast<unsigned long long>(slot), static_cast<void*>(self));
     write_log(line);
-    return S_OK;
+    return E_NOTIMPL;
 }
 
-BOOL CALLBACK init_fake_slot73_object(PINIT_ONCE, PVOID, PVOID*)
+// Prefer the newest desktop list interface the SDK exposes, then fall back to the base one.
+HRESULT create_real_command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
+                                 ID3D12CommandAllocator* allocator,
+                                 ID3D12PipelineState* initial_pso, void** out)
 {
-    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(
-        nullptr, fake_slot73_stub_block_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (!code) return FALSE;
+#if defined(__ID3D12GraphicsCommandList6_INTERFACE_DEFINED__)
+    const HRESULT newer = device->CreateCommandList(node_mask, type, allocator, initial_pso,
+                                                    __uuidof(ID3D12GraphicsCommandList6), out);
+    if (SUCCEEDED(newer)) return newer;
+    *out = nullptr;
+#endif
+    return device->CreateCommandList(node_mask, type, allocator, initial_pso,
+                                     __uuidof(ID3D12GraphicsCommandList), out);
+}
 
-    fake_slot73_vtable[0] = reinterpret_cast<void*>(&fake_slot73_query_interface);
-    fake_slot73_vtable[1] = reinterpret_cast<void*>(&fake_slot73_add_ref);
-    fake_slot73_vtable[2] = reinterpret_cast<void*>(&fake_slot73_release);
+XsCommandListProxy* create_command_list_proxy(void* real_list)
+{
+    auto* proxy = new (std::nothrow) XsCommandListProxy{};
+    if (!proxy) return nullptr;
+
+    proxy->vtable_memory = new (std::nothrow) void*[command_list_vtable_slots]{};
+    if (!proxy->vtable_memory) {
+        delete proxy;
+        return nullptr;
+    }
+
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(
+        nullptr, command_list_thunk_block_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!code) {
+        delete[] proxy->vtable_memory;
+        delete proxy;
+        return nullptr;
+    }
+
+    proxy->vtable = proxy->vtable_memory;
+    proxy->vtable_memory[0] = reinterpret_cast<void*>(&command_list_query_interface);
+    proxy->vtable_memory[1] = reinterpret_cast<void*>(&command_list_add_ref);
+    proxy->vtable_memory[2] = reinterpret_cast<void*>(&command_list_release);
 
     std::uint8_t* cursor = code;
-    for (std::size_t slot = 3; slot < fake_slot73_vtable_slots; ++slot) {
+    for (std::size_t slot = command_list_forward_first; slot <= command_list_forward_last; ++slot) {
+        void* thunk = cursor;
+        cursor = emit_forward_thunk(
+            cursor, static_cast<std::uint32_t>(offsetof(XsCommandListProxy, real_list)),
+            static_cast<std::uint32_t>(slot), false);
+        proxy->vtable_memory[slot] = thunk;
+    }
+    for (std::size_t slot = command_list_stub_first; slot < command_list_vtable_slots; ++slot) {
         void* stub = cursor;
-        cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&fake_slot73_default));
-        fake_slot73_vtable[slot] = stub;
+        cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&command_list_unimplemented));
+        proxy->vtable_memory[slot] = stub;
     }
 
-    if (cursor != code + fake_slot73_stub_block_bytes) {
+    if (cursor != code + command_list_thunk_block_bytes) {
         VirtualFree(code, 0, MEM_RELEASE);
-        return FALSE;
+        delete[] proxy->vtable_memory;
+        delete proxy;
+        return nullptr;
     }
 
-    FlushInstructionCache(GetCurrentProcess(), code, fake_slot73_stub_block_bytes);
+    FlushInstructionCache(GetCurrentProcess(), code, command_list_thunk_block_bytes);
     DWORD previous_protection = 0;
-    if (!VirtualProtect(code, fake_slot73_stub_block_bytes, PAGE_EXECUTE_READ,
+    if (!VirtualProtect(code, command_list_thunk_block_bytes, PAGE_EXECUTE_READ,
                         &previous_protection)) {
         VirtualFree(code, 0, MEM_RELEASE);
-        return FALSE;
+        delete[] proxy->vtable_memory;
+        delete proxy;
+        return nullptr;
     }
 
-    fake_slot73_object.vtable = fake_slot73_vtable;
-    fake_slot73_object.references = 0;
-    fake_slot73_ready = true;
-    return TRUE;
+    proxy->thunk_memory = code;
+    proxy->real_list = real_list;
+    proxy->references = 1; // the caller's reference; one proxy per CreateCommandListX call
+    return proxy;
 }
 
-// Xbox device vtable slot 73 (offset 0x248). Under the x64 calling convention arguments 5 and 6
-// arrive on the stack; only the out pointer is interpreted. The descriptor and the other arguments
-// are deliberately not dereferenced.
-HRESULT WINAPI create_xbox_slot73(ProxyDevice* proxy, const void* desc, void* r8, uintptr_t r9,
-                                  void* arg5, void** out)
+// Xbox device vtable slot 73 (offset 0x248). Arguments 5 and 6 arrive on the stack under x64.
+HRESULT WINAPI create_xbox_command_list(ProxyDevice* proxy, const XboxCommandListDesc* desc,
+                                        void* allocator, void* initial_pso,
+                                        const GUID* requested_iid, void** out)
 {
-    (void)r8;
-    (void)r9;
-    (void)arg5;
     if (!out) return E_POINTER;
     *out = nullptr;
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
 
-    if (!InitOnceExecuteOnce(&fake_slot73_init_once, init_fake_slot73_object, nullptr, nullptr) ||
-        !fake_slot73_ready) {
-        write_log("d3d12_xs: slot-73 fake object initialization failed -> E_OUTOFMEMORY\n");
+    const D3D12_COMMAND_LIST_TYPE type = desc
+        ? static_cast<D3D12_COMMAND_LIST_TYPE>(desc->type)
+        : D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const UINT node_mask = desc ? desc->node_mask : 1u;
+
+    void* real_list = nullptr;
+    const HRESULT create_hr = create_real_command_list(
+        proxy->real, node_mask, type, static_cast<ID3D12CommandAllocator*>(allocator),
+        static_cast<ID3D12PipelineState*>(initial_pso), &real_list);
+    if (FAILED(create_hr) || !real_list) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateCommandListX type=%u node=%u -> 0x%08lx\n",
+                      static_cast<unsigned>(type), static_cast<unsigned>(node_mask),
+                      static_cast<unsigned long>(create_hr));
+        write_log(line);
+        *out = nullptr;
+        return FAILED(create_hr) ? create_hr : E_FAIL;
+    }
+
+    XsCommandListProxy* list_proxy = create_command_list_proxy(real_list);
+    if (!list_proxy) {
+        static_cast<ID3D12GraphicsCommandList*>(real_list)->Release();
+        write_log("d3d12_xs: command-list proxy allocation failed -> E_OUTOFMEMORY\n");
+        *out = nullptr;
         return E_OUTOFMEMORY;
     }
 
-    FakeSlot73Object* object = &fake_slot73_object;
-    fake_slot73_add_ref(object);
-    *out = object;
-
-    char line[192];
+    char iid_text[64];
+    if (requested_iid) {
+        format_iid(*requested_iid, iid_text, sizeof(iid_text));
+    } else {
+        std::snprintf(iid_text, sizeof(iid_text), "<null>");
+    }
+    char line[256];
     std::snprintf(line, sizeof(line),
-                  "d3d12_xs: xbox vtable slot 73 called (device=%p desc=%p arg5=%p) -> fake "
-                  "object %p\n",
-                  static_cast<void*>(proxy), const_cast<void*>(desc), arg5,
-                  static_cast<void*>(object));
+                  "d3d12_xs: slot 73 CreateCommandListX device=%p desc=%p type=%u node=%u iid=%s "
+                  "real=%p proxy=%p\n",
+                  static_cast<void*>(proxy), static_cast<const void*>(desc),
+                  static_cast<unsigned>(type), static_cast<unsigned>(node_mask), iid_text,
+                  real_list, static_cast<void*>(list_proxy));
     write_log(line);
+
+    *out = list_proxy;
     return S_OK;
 }
 
@@ -404,6 +522,142 @@ HRESULT WINAPI configure_frame_event(ProxyDevice*, std::uintptr_t, std::uintptr_
 // The measured title calls GDK CreateCommandQueueX at offset 0x180 (slot 48), before the desktop
 // Device1+ methods. Translate its Xbox queue descriptor to the desktop descriptor and use slot 8 of
 // the real device. Only the Type field is measured; priority/flags/node are desktop defaults.
+// Desktop D3D12 limits shader-visible CBV/SRV/UAV heaps to 1,000,000 descriptors. The measured
+// title requests 0x130000 (1,245,184), which makes the desktop debug layer throw E_INVALIDARG.
+// Clamp only this shader-visible view heap, create the real heap, and patch the title's expected
+// pool base global (exe RVA 0x75df188) to the real heap's CPU start. The pool builder compares that
+// base after creation; without the patch it hits its own debug break.
+// Desktop descriptor-heap proxy. The console call site uses a C-style handle return (RAX) while the
+// desktop heap's handle getters are sret-style; returning the raw desktop heap made the getter write
+// through the title's second argument. The proxy forwards handle getters in the title's ABI and
+// exposes the real heap's CPU/GPU handle values.
+struct DescriptorHeapProxy {
+    void** vtable;              // +0
+    volatile LONG references;   // +8
+    ID3D12DescriptorHeap* real; // +16
+    void** vtable_memory;       // +24
+};
+
+void destroy_descriptor_heap_proxy(DescriptorHeapProxy* proxy)
+{
+    if (proxy->real) proxy->real->Release();
+    delete[] proxy->vtable_memory;
+    delete proxy;
+}
+
+ULONG WINAPI descriptor_heap_add_ref(DescriptorHeapProxy* proxy)
+{
+    return static_cast<ULONG>(InterlockedIncrement(&proxy->references));
+}
+
+ULONG WINAPI descriptor_heap_release(DescriptorHeapProxy* proxy)
+{
+    const LONG remaining = InterlockedDecrement(&proxy->references);
+    if (remaining == 0) destroy_descriptor_heap_proxy(proxy);
+    return static_cast<ULONG>(remaining);
+}
+
+HRESULT WINAPI descriptor_heap_query_interface(DescriptorHeapProxy* proxy, REFIID iid, void** out)
+{
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap)) ||
+        IsEqualIID(iid, __uuidof(ID3D12Pageable)) || IsEqualIID(iid, __uuidof(ID3D12DeviceChild))) {
+        descriptor_heap_add_ref(proxy);
+        *out = proxy;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_cpu(DescriptorHeapProxy* proxy)
+{
+    return proxy->real->GetCPUDescriptorHandleForHeapStart();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_gpu(DescriptorHeapProxy* proxy)
+{
+    return proxy->real->GetGPUDescriptorHandleForHeapStart();
+}
+
+HRESULT WINAPI descriptor_heap_unimplemented(DescriptorHeapProxy*)
+{
+    return E_NOTIMPL;
+}
+
+DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
+{
+    auto* proxy = new (std::nothrow) DescriptorHeapProxy{};
+    if (!proxy) return nullptr;
+    proxy->vtable_memory = new (std::nothrow) void*[16]{};
+    if (!proxy->vtable_memory) {
+        delete proxy;
+        return nullptr;
+    }
+    proxy->vtable = proxy->vtable_memory;
+    proxy->references = 1;
+    proxy->real = real;
+    proxy->vtable_memory[0] = reinterpret_cast<void*>(&descriptor_heap_query_interface);
+    proxy->vtable_memory[1] = reinterpret_cast<void*>(&descriptor_heap_add_ref);
+    proxy->vtable_memory[2] = reinterpret_cast<void*>(&descriptor_heap_release);
+    for (std::size_t slot = 3; slot < 16; ++slot) {
+        proxy->vtable_memory[slot] = reinterpret_cast<void*>(&descriptor_heap_unimplemented);
+    }
+    proxy->vtable_memory[9] = reinterpret_cast<void*>(&descriptor_heap_get_cpu);
+    proxy->vtable_memory[10] = reinterpret_cast<void*>(&descriptor_heap_get_gpu);
+    return proxy;
+}
+
+constexpr std::size_t create_descriptor_heap_slot = 14;
+constexpr UINT desktop_shader_visible_limit = 1'000'000;
+constexpr std::uintptr_t descriptor_pool_base_rva = 0x75DF188;
+
+HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                      REFIID iid, void** heap)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!desc || !heap) return E_POINTER;
+    *heap = nullptr;
+    D3D12_DESCRIPTOR_HEAP_DESC copy = *desc;
+    const bool clamp = (copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+                       copy.NumDescriptors > desktop_shader_visible_limit;
+    if (clamp) copy.NumDescriptors = desktop_shader_visible_limit;
+    ID3D12DescriptorHeap* real_heap = nullptr;
+    const HRESULT result = proxy->real->CreateDescriptorHeap(
+        &copy, iid, reinterpret_cast<void**>(&real_heap));
+    if (FAILED(result) || !real_heap) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateDescriptorHeap type=%u num=%u flags=%u -> 0x%08lx\n",
+                      static_cast<unsigned>(copy.Type), static_cast<unsigned>(copy.NumDescriptors),
+                      static_cast<unsigned>(copy.Flags), static_cast<unsigned long>(result));
+        write_log(line);
+        return FAILED(result) ? result : E_FAIL;
+    }
+    const auto cpu = real_heap->GetCPUDescriptorHandleForHeapStart();
+    if (clamp) {
+        if (HMODULE game = GetModuleHandleW(nullptr)) {
+            auto* slot = reinterpret_cast<std::uintptr_t*>(
+                reinterpret_cast<unsigned char*>(game) + descriptor_pool_base_rva);
+            *slot = cpu.ptr;
+        }
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: clamped descriptor heap %u -> %u cpu=0x%llx\n",
+                      static_cast<unsigned>(desc->NumDescriptors),
+                      static_cast<unsigned>(copy.NumDescriptors),
+                      static_cast<unsigned long long>(cpu.ptr));
+        write_log(line);
+    }
+    DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap);
+    if (!wrapper) {
+        real_heap->Release();
+        return E_OUTOFMEMORY;
+    }
+    *heap = wrapper;
+    return result;
+}
+
 constexpr std::size_t create_command_queue_x_slot = 48;
 
 HRESULT WINAPI create_command_queue_x(ProxyDevice* proxy, const void* desc, REFIID iid, void** queue)
@@ -471,8 +725,10 @@ ProxyDevice* create_proxy(ID3D12Device* real)
     }
     proxy->vtable_memory[create_command_queue_x_slot] =
         reinterpret_cast<void*>(&create_command_queue_x);
+    proxy->vtable_memory[create_descriptor_heap_slot] =
+        reinterpret_cast<void*>(&create_descriptor_heap);
     proxy->vtable_memory[create_xbox_slot73_index] =
-        reinterpret_cast<void*>(&create_xbox_slot73);
+        reinterpret_cast<void*>(&create_xbox_command_list);
     proxy->vtable_memory[set_frame_interval_x_slot] =
         reinterpret_cast<void*>(&set_frame_interval_x);
     proxy->vtable_memory[configure_frame_event_slot] =
