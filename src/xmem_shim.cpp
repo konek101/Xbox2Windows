@@ -40,6 +40,9 @@ bool is_graphics(std::uint64_t attributes) noexcept
 // The selector the AMD callers pass, and the offset of the value they read.
 constexpr UINT32 gpu_usage_selector = 0x20000001;
 constexpr std::size_t gpu_usage_offset = 8;
+
+// HRESULT E_NOTIMPL for the loader-gap exports that have no desktop implementation.
+constexpr std::int32_t not_implemented = static_cast<std::int32_t>(0x80004001u);
 }
 
 extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
@@ -120,4 +123,43 @@ extern "C" BOOL WINAPI XMemIsToolsMemAvailable()
 {
     // The desktop runtime has no devkit tools-memory partition.
     return FALSE;
+}
+
+// XMemVirtualAlloc(address, size, flAllocationType, XMemFlags, flProtect). The observed recorder
+// passes 0x20402000/0x21/0x4 and 0x20402000/0x3/0x801. The Xbox allocation type and protection
+// carry console page-size and mapping bits that desktop VirtualAlloc rejects. Keep the standard
+// reserve/commit state and a valid base protection so the title's multi-gigabyte reservations
+// succeed. The XMemFlags page-kind details are not modeled here.
+extern "C" void* XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
+                                  ULONGLONG /*flags*/, DWORD protect)
+{
+    constexpr DWORD reserve = 0x00002000;
+    constexpr DWORD commit = 0x00001000;
+    constexpr DWORD reset = 0x00080000;
+    constexpr DWORD top_down = 0x00100000;
+    DWORD type = 0;
+    if (allocation_type & reserve) type |= MEM_RESERVE;
+    if (allocation_type & commit) type |= MEM_COMMIT;
+    if (allocation_type & reset) type |= MEM_RESET;
+    if (allocation_type & top_down) type |= MEM_TOP_DOWN;
+    if (!type) type = MEM_RESERVE;
+    DWORD base_protect = protect & 0xFFu;
+    if (!base_protect) base_protect = PAGE_READWRITE;
+    if (!(type & MEM_COMMIT)) base_protect = PAGE_NOACCESS;
+    return VirtualAlloc(address, bytes, type, base_protect);
+}
+
+extern "C" std::int32_t XMemMapPhysicalPages(ULONGLONG, ULONGLONG, ULONGLONG, ULONGLONG)
+{
+    return not_implemented;
+}
+
+extern "C" std::int32_t XMemMapPhysicalPagesScatter(ULONGLONG, ULONGLONG, ULONGLONG, ULONGLONG)
+{
+    return not_implemented;
+}
+
+extern "C" std::int32_t XMemTransferMemory(ULONGLONG, ULONGLONG, ULONGLONG, ULONGLONG)
+{
+    return not_implemented;
 }

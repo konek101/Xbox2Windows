@@ -3819,6 +3819,35 @@ For each candidate the tool records SHA-256, architecture, entry RVA and section
 
 `pe.startup.locations` lists TLS callbacks in table order followed by the executable entry. Each location includes its RVA, section and file offset. When the x64 exception directory supplies a covering function interval, the report includes its inclusive start, exclusive end and unwind data RVA. A location can legitimately lack a covering record. An absent or unusable table leaves the independently observed startup locations available. In the local debug fixture the table had 110 records, one covering its TLS callback. The entry had no covering record. CTest cross-checks against pefile and exercises both absent and incomplete directories. [Microsoft x64 unwind data](https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64)
 
+### Loader-gap providers for Xbox-only imports
+
+The inspected Scarlett executable has 1,924 import edges: 1,807 resolve to desktop providers and 117 have no provider. Bundled package DLLs supply 72 of the 117, so 45 edges across seven Xbox-only modules remain: `acphal.dll`, `chad.dll`, `xapu.dll`, `xg_xs.dll`, `xcrdapi.dll`, `xmem.dll` and `d3d12_xs.dll`. The executable alone accounts for 37 of the 45. `tools/pe_inventory.py` records the edges in `out/reports/scarlett-inventory.json`.
+
+The loader-gap work adds providers for the measured names. `src/xbox_stub_providers.cpp` builds `acphal.dll`, `chad.dll`, `xapu.dll` and `xg_xs.dll` from import-table exports and fails closed. `src/xcrdapi_factory.cpp` supplies a real DirectStorage factory object. `src/xmem_shim.cpp` carries the upstream default allocation and physical-page pairs (see below), implements `XMemVirtualAlloc` as a desktop reservation, reports tools memory unavailable and fails closed for the unmodeled map, scatter and transfer entries. `src/d3d12_xs_shim.cpp` exports `D3D12ConfigureVirtualMemoryX`, whose proposed desktop policy is `S_OK` because desktop D3D12 owns device virtual memory. The exported names are measured; parameter shapes remain placeholders, and no console behavior is reproduced.
+
+Build the providers and run the loader check:
+
+```powershell
+cmake --build --preset dev --target xbox_stub_providers_check
+ctest --preset dev --no-tests=error -R '^xbox_stub_providers$' -V
+```
+
+The fixture resolves all 32 bound imports by name, confirms each module owns the addressed export and checks representative desktop policies. `tools/xbox_gap_report.py` compares the inventory with the built DLLs:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools/xbox_gap_report.py out/reports/scarlett-inventory.json out/build/dev --image game_scarlett_master.exe
+```
+
+For the local package it reported 37 closed and 0 open edges for the executable and 45 closed and 0 open for the package. Closing the static import surface does not establish that the shims match the console or that startup proceeds; startup and frame rate remain unverified.
+
+`tools/stub_call_sites.py` relates the same edges to code by scanning for the linker's direct import forms and the `jmp [slot]` thunks they target. It opens the image for reading and never loads it.
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools/stub_call_sites.py "game-files\game_scarlett_master.exe" out/reports/scarlett-inventory.json
+```
+
+For the local executable all 37 gap symbols had at least one direct site, spread over 46 consumer functions. The largest consumers were `XMemVirtualAlloc` (9 functions, 23 call sites), `XMemMapPhysicalPages` (5, 12), `XMemAllocatePhysicalPages` (4, 4), `XGCreateTextureComputer` (4, 4) and `XApuEnqueueCommand` (4, 4). No site fell inside the entry point, a TLS callback or a function one or two direct branches from them. The bundled upscaler, Bink and BVH DLLs account for the other eight edges, each with at least one site. These are static direct calls only; register-indirect calls and jump tables are not seen, and the executable is never run, so first-failure order remains a hypothesis.
+
 ### Frame plane requests in BinkAllocateFrameBuffers
 
 One iteration of the exported frame-buffer allocator issues up to five requests to the [group descriptor append helper](#grouped-allocation-descriptor-builders). Slots 0, 3 and 4 use the first pitch and height. Slots 1 and 2 use the second pair. With pitches 96 and 32 and heights 7 and 3, enabling all five produced sizes 672, 96, 96, 672 and 672 in that order. Each call received the address of the selected plane's destination field, and its pitch field was written after the call.

@@ -67,3 +67,12 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
     return D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, iid, device);
 }
+
+// Loader-gap export measured on the inspected executable (docs/experiments.md). Desktop D3D12
+// owns device virtual memory, so there is no equivalent configuration step: report success and
+// leave the desktop allocator in charge. The parameter shape is a placeholder, not a verified
+// Scarlett ABI.
+extern "C" HRESULT WINAPI d3d12_xs_ConfigureVirtualMemoryX(ID3D12Device*, const void*)
+{
+    return S_OK;
+}

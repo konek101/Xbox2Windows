@@ -106,6 +106,37 @@ set_target_properties(d3d12_xs_shim PROPERTIES OUTPUT_NAME d3d12_xs)
 target_compile_features(d3d12_xs_shim PRIVATE cxx_std_17)
 target_link_libraries(d3d12_xs_shim PRIVATE d3d12)
 
+# Desktop xgameruntime.dll for GDK titles that load the runtime by name at run time and resolve
+# InitializeApiImpl*/QueryApiImpl/XErrorReport with GetProcAddress.
+add_library(xgameruntime_shim SHARED src/xgameruntime_shim.cpp src/xgameruntime_shim.def)
+set_target_properties(xgameruntime_shim PROPERTIES OUTPUT_NAME xgameruntime)
+target_compile_features(xgameruntime_shim PRIVATE cxx_std_17)
+
+# Desktop loader-gap providers for the Xbox-only modules the Scarlett executable imports. Each
+# module's exports are measured from the package's import table; calls without a desktop policy fail
+# closed. One translation unit builds the fail-closed modules, selected by the XBOX_STUB_* macro and
+# the matching .def.
+function(add_xbox_stub_provider target module macro)
+    add_library(${target} SHARED src/xbox_stub_providers.cpp "src/${module}.def")
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME ${module})
+    target_compile_definitions(${target} PRIVATE ${macro})
+    target_compile_features(${target} PRIVATE cxx_std_17)
+endfunction()
+add_xbox_stub_provider(acphal_shim acphal XBOX_STUB_ACPHAL)
+add_xbox_stub_provider(chad_shim chad XBOX_STUB_CHAD)
+add_xbox_stub_provider(xapu_shim xapu XBOX_STUB_XAPU)
+add_xbox_stub_provider(xg_xs_shim xg_xs XBOX_STUB_XG_XS)
+# xcrdapi.dll's DirectStorage factory is a real object, so it is not a fail-closed provider.
+add_library(xcrdapi_shim SHARED src/xcrdapi_factory.cpp src/xcrdapi.def)
+set_target_properties(xcrdapi_shim PROPERTIES OUTPUT_NAME xcrdapi)
+target_compile_features(xcrdapi_shim PRIVATE cxx_std_17)
+add_executable(xbox_stub_providers_check tests/xbox_stub_providers_check.cpp)
+target_link_libraries(xbox_stub_providers_check PRIVATE acphal_shim chad_shim xapu_shim
+    xg_xs_shim xcrdapi_shim xmem_shim d3d12_xs_shim)
+target_compile_features(xbox_stub_providers_check PRIVATE cxx_std_17)
+add_test(NAME xbox_stub_providers COMMAND xbox_stub_providers_check)
+set_tests_properties(xbox_stub_providers PROPERTIES TIMEOUT 30)
+
 find_program(DXC_EXECUTABLE dxc REQUIRED)
 get_filename_component(DXC_BIN_DIR "${DXC_EXECUTABLE}" DIRECTORY)
 target_compile_definitions(root_probe PRIVATE SDK_DXC_DIR=L"${DXC_BIN_DIR}/")
