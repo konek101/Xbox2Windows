@@ -712,6 +712,7 @@ struct DescriptorHeapProxy {
     volatile LONG references;   // +8
     ID3D12DescriptorHeap* real; // +16
     void** vtable_memory;       // +24
+    bool use_legacy_base;       // +32 shader-visible pool reports the title's recorded base
 };
 
 void destroy_descriptor_heap_proxy(DescriptorHeapProxy* proxy)
@@ -746,14 +747,37 @@ HRESULT WINAPI descriptor_heap_query_interface(DescriptorHeapProxy* proxy, REFII
     return E_NOINTERFACE;
 }
 
+// The title derives descriptor handles from this start and later compares it against the legacy XMem
+// pool base it recorded at game RVA 0x1e864ac. Reporting the desktop heap address makes that check
+// fail; reporting the recorded base keeps the title's own bookkeeping coherent. The GPU handle is
+// offset by the same delta so CPU/GPU pairs stay consistent.
+constexpr std::uintptr_t legacy_descriptor_pool_base_rva = 0x75DF188;
+
+std::uintptr_t legacy_pool_base()
+{
+    HMODULE game = GetModuleHandleW(nullptr);
+    if (!game) return 0;
+    const auto* slot = reinterpret_cast<const std::uintptr_t*>(
+        reinterpret_cast<const unsigned char*>(game) + legacy_descriptor_pool_base_rva);
+    return *slot;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_cpu(DescriptorHeapProxy* proxy)
 {
-    return proxy->real->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = proxy->real->GetCPUDescriptorHandleForHeapStart();
+    const std::uintptr_t legacy = legacy_pool_base();
+    if (proxy->use_legacy_base && legacy) return D3D12_CPU_DESCRIPTOR_HANDLE{legacy};
+    return real;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_gpu(DescriptorHeapProxy* proxy)
 {
-    return proxy->real->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE real = proxy->real->GetGPUDescriptorHandleForHeapStart();
+    const std::uintptr_t legacy = legacy_pool_base();
+    const std::uintptr_t cpu = proxy->real->GetCPUDescriptorHandleForHeapStart().ptr;
+    if (proxy->use_legacy_base && legacy && cpu)
+        return D3D12_GPU_DESCRIPTOR_HANDLE{real.ptr + (legacy - cpu)};
+    return real;
 }
 
 HRESULT WINAPI descriptor_heap_unimplemented(DescriptorHeapProxy*)
@@ -761,7 +785,7 @@ HRESULT WINAPI descriptor_heap_unimplemented(DescriptorHeapProxy*)
     return E_NOTIMPL;
 }
 
-DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
+DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real, bool use_legacy_base)
 {
     auto* proxy = new (std::nothrow) DescriptorHeapProxy{};
     if (!proxy) return nullptr;
@@ -779,6 +803,7 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
     for (std::size_t slot = 3; slot < 16; ++slot) {
         proxy->vtable_memory[slot] = reinterpret_cast<void*>(&descriptor_heap_unimplemented);
     }
+    proxy->use_legacy_base = use_legacy_base;
     proxy->vtable_memory[9] = reinterpret_cast<void*>(&descriptor_heap_get_cpu);
     proxy->vtable_memory[10] = reinterpret_cast<void*>(&descriptor_heap_get_gpu);
     return proxy;
@@ -899,7 +924,39 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
                       static_cast<unsigned>(copy.NumDescriptors));
         write_log(line);
     }
-    DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap);
+    // The title's descriptor bump allocator writes its descriptor array into the pool base it
+    // recorded at game RVA 0x1e864ac. That range is only reserved (PAGE_NOACCESS) by the XMem shim,
+    // so make it writable for the bookkeeping the title performs there. Measured: without this the
+    // first `mov dword ptr [pool_base], n` faults.
+    if ((copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        const std::uintptr_t legacy = legacy_pool_base();
+        const UINT increment = proxy->real->GetDescriptorHandleIncrementSize(copy.Type);
+        if (legacy && increment) {
+            const SIZE_T bytes = static_cast<SIZE_T>(copy.NumDescriptors) * increment;
+            // The legacy base is one segment of the title's XMem pool, not the whole descriptor
+            // array, so commit in 64 KiB pages and stop at the first hole. The title's writes stay
+            // inside the committed part.
+            SIZE_T committed_bytes = 0;
+            constexpr SIZE_T page = 64 * 1024;
+            while (committed_bytes < bytes) {
+                const SIZE_T step = bytes - committed_bytes < page ? bytes - committed_bytes : page;
+                if (!VirtualAlloc(reinterpret_cast<void*>(legacy + committed_bytes), step, MEM_COMMIT,
+                                  PAGE_READWRITE))
+                    break;
+                committed_bytes += step;
+            }
+            char line[224];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: legacy descriptor pool commit base=0x%llx requested=%llu "
+                          "committed=%llu\n",
+                          static_cast<unsigned long long>(legacy),
+                          static_cast<unsigned long long>(bytes),
+                          static_cast<unsigned long long>(committed_bytes));
+            write_log(line);
+        }
+    }
+
+    DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap, (copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0);
     if (!wrapper) {
         real_heap->Release();
         return E_OUTOFMEMORY;
