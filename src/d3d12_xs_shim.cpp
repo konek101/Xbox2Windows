@@ -1004,6 +1004,33 @@ HRESULT WINAPI create_command_queue_x(ProxyDevice* proxy, const void* desc, REFI
 // remaining arguments do not match that signature either. Two earlier versions of this handler
 // faulted by writing through a misinterpreted out pointer, so this stays fail-closed and never
 // dereferences anything.
+// Console device slot 86 is CreatePipelineState for stream descriptors (public XCL reference slot
+// table). Desktop has the same shape at ID3D12Device2 slot 47, so forward it and report the result
+// instead of answering S_OK without producing an object.
+constexpr std::size_t create_pipeline_state_streams_slot = 86;
+
+HRESULT WINAPI create_pipeline_state_streams(ProxyDevice* proxy,
+                                             const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                             REFIID iid, void** state)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!state) return E_POINTER;
+    *state = nullptr;
+    if (!desc) return E_INVALIDARG;
+
+    ID3D12Device2* device2 = nullptr;
+    HRESULT result = proxy->real->QueryInterface(__uuidof(ID3D12Device2),
+                                                 reinterpret_cast<void**>(&device2));
+    if (FAILED(result) || !device2) return E_NOTIMPL;
+    result = device2->CreatePipelineState(desc, iid, state);
+    device2->Release();
+    char line[192];
+    std::snprintf(line, sizeof(line), "d3d12_xs: slot86 CreatePipelineState streams -> 0x%08lx\n",
+                  static_cast<unsigned long>(result));
+    write_log(line);
+    return result;
+}
+
 constexpr std::size_t create_meta_command_slot = 61;
 
 HRESULT WINAPI create_meta_command(ProxyDevice*, const void*, std::uintptr_t, std::uintptr_t,
@@ -1014,6 +1041,47 @@ HRESULT WINAPI create_meta_command(ProxyDevice*, const void*, std::uintptr_t, st
         write_log("d3d12_xs: slot61 console meta command unsupported -> E_NOTIMPL\n");
     }
     return E_NOTIMPL;
+}
+
+// Console device slot 61 is CreateSamplerX (public XCL slot table): a 0x6C-byte console sampler
+// descriptor plus a destination descriptor address. Measured arguments: a1 = descriptor, a2 =
+// destination in the title's descriptor pool. Desktop has no console S# encoding, so write a valid
+// anisotropic PC sampler at that address and log the raw console bytes for future refinement.
+constexpr std::size_t create_sampler_x_slot = 61;
+
+HRESULT WINAPI create_sampler_x(ProxyDevice* proxy, const void* desc, std::uintptr_t destination,
+                                std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    static volatile LONG logged = 0;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "d3d12_xs: slot61 CreateSamplerX desc=%p dest=0x%llx\n",
+                      const_cast<void*>(desc), static_cast<unsigned long long>(destination));
+        write_log(line);
+        if (desc) {
+            const auto* bytes = static_cast<const unsigned char*>(desc);
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: slot61 sampler %02x%02x%02x%02x %02x%02x%02x%02x "
+                          "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                          bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                          bytes[14], bytes[15]);
+            write_log(line);
+        }
+    }
+    if (!destination) return E_INVALIDARG;
+    D3D12_SAMPLER_DESC pc{};
+    pc.Filter = D3D12_FILTER_ANISOTROPIC;
+    pc.MaxAnisotropy = 16;
+    pc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    pc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    pc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    pc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pc.MinLOD = 0.0f;
+    pc.MaxLOD = D3D12_FLOAT32_MAX;
+    proxy->real->CreateSampler(&pc, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+    return S_OK;
 }
 
 constexpr std::size_t create_committed_resource_x_slot = 127;
@@ -1631,7 +1699,9 @@ ProxyDevice* create_proxy(ID3D12Device* real)
     proxy->vtable_memory[create_command_signature_slot] =
         reinterpret_cast<void*>(&create_command_signature_x);
     proxy->vtable_memory[create_meta_command_slot] =
-        reinterpret_cast<void*>(&create_meta_command);
+        reinterpret_cast<void*>(&create_sampler_x);
+    proxy->vtable_memory[create_pipeline_state_streams_slot] =
+        reinterpret_cast<void*>(&create_pipeline_state_streams);
     proxy->vtable_memory[create_xbox_slot73_index] =
         reinterpret_cast<void*>(&create_xbox_command_list);
     proxy->vtable_memory[slot78_slot] = reinterpret_cast<void*>(&slot78_noop);
