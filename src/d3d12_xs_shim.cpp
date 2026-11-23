@@ -1006,9 +1006,38 @@ HRESULT WINAPI create_state_object(ProxyDevice* proxy, const D3D12_STATE_OBJECT_
 // R8 = D3D12_SHADER_RESOURCE_VIEW_DESC*, R9 = ID3D12Resource*. Translate to desktop slot 18.
 constexpr std::size_t create_shader_resource_view_x_slot = 70;
 
-HRESULT WINAPI create_shader_resource_view_x(ProxyDevice*, const D3D12_CPU_DESCRIPTOR_HANDLE*,
-                                             const void*, std::uint32_t)
+// Slot 70 (offset 0x230) is the console view-creation entry used by the descriptor wrapper at game
+// RVA 0x4ecc800. Its measured call is (device, source, desc, destination). The desktop equivalent
+// needs a real ID3D12Resource plus a view description, and the console payload layout is not yet
+// established, so the handler records the first call's arguments and stays inert. Diagnostic only.
+HRESULT WINAPI create_shader_resource_view_x(ProxyDevice* proxy, const void* source,
+                                             const void* desc, void* destination)
 {
+    static volatile LONG logged = 0;
+    if (proxy && proxy->real && InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: slot70 view source=%p desc=%p dest=%p\n",
+                      const_cast<void*>(source), const_cast<void*>(desc), destination);
+        write_log(line);
+        if (desc) {
+            const auto* bytes = static_cast<const unsigned char*>(desc);
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: slot70 desc %02x%02x%02x%02x %02x%02x%02x%02x "
+                          "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                          bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                          bytes[14], bytes[15]);
+            write_log(line);
+        }
+        if (source) {
+            std::uintptr_t vtable = 0;
+            std::memcpy(&vtable, source, sizeof(vtable));
+            std::snprintf(line, sizeof(line), "d3d12_xs: slot70 source vtable=0x%llx\n",
+                          static_cast<unsigned long long>(vtable));
+            write_log(line);
+        }
+    }
     return S_OK;
 }
 
