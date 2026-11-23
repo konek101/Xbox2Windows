@@ -611,6 +611,7 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
 constexpr std::size_t create_descriptor_heap_slot = 14;
 constexpr UINT desktop_shader_visible_limit = 1'000'000;
 constexpr std::uintptr_t descriptor_pool_base_rva = 0x75DF188;
+constexpr std::uintptr_t descriptor_pool_size_rva = 0x75DF190;
 
 HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                       REFIID iid, void** heap)
@@ -637,9 +638,13 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
     const auto cpu = real_heap->GetCPUDescriptorHandleForHeapStart();
     if (clamp) {
         if (HMODULE game = GetModuleHandleW(nullptr)) {
-            auto* slot = reinterpret_cast<std::uintptr_t*>(
+            auto* base_slot = reinterpret_cast<std::uintptr_t*>(
                 reinterpret_cast<unsigned char*>(game) + descriptor_pool_base_rva);
-            *slot = cpu.ptr;
+            *base_slot = cpu.ptr;
+            const UINT increment = proxy->real->GetDescriptorHandleIncrementSize(copy.Type);
+            auto* size_slot = reinterpret_cast<std::uintptr_t*>(
+                reinterpret_cast<unsigned char*>(game) + descriptor_pool_size_rva);
+            *size_slot = static_cast<std::uintptr_t>(copy.NumDescriptors) * increment;
         }
         char line[192];
         std::snprintf(line, sizeof(line),
