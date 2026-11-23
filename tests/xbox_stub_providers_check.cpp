@@ -161,6 +161,12 @@ bool virtual_alloc_reserves()
     return reservation && VirtualFree(reservation, 0, MEM_RELEASE) != 0;
 }
 
+bool physical_page_query()
+{
+    ULONG_PTR page = 0x1234;
+    return XMemAllocatePhysicalPages(0x280, &page, nullptr) == TRUE && page == 0x1234;
+}
+
 bool dstorage_factory()
 {
     void* raw = nullptr;
@@ -179,11 +185,12 @@ int main()
 {
     if (!bindings_resolve()) return 1;
     if (!applies_desktop_policy()) return 2;
-    if (!dstorage_factory()) return 3;
-    if (!virtual_alloc_reserves()) return 4;
+    if (!physical_page_query()) return 3;
+    if (!dstorage_factory()) return 4;
+    if (!virtual_alloc_reserves()) return 5;
     std::printf("xbox_stub_providers: %zu imports resolved; every probed call applied its "
-                "desktop policy, XMemVirtualAlloc reserves, and the DirectStorage factory accepts "
-                "its staging-buffer size\n",
+                "desktop policy, the physical-page query keeps its page, XMemVirtualAlloc reserves, "
+                "and the DirectStorage factory accepts its staging-buffer size\n",
                 sizeof(bindings) / sizeof(bindings[0]));
     return 0;
 }

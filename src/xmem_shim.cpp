@@ -108,6 +108,15 @@ BOOL physical_result(era_physical::Status status) noexcept
 extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR count, PULONG_PTR pages)
 {
     static_assert(sizeof(ULONG_PTR) == sizeof(std::uint64_t));
+    // Observed Scarlett call at 0x5eb2780: XMemAllocatePhysicalPages(0x280, &page, context), where
+    // the caller rounds a virtual address to a 64 KiB page, stores it in *count, and requires the
+    // slot to come back unchanged with TRUE. Desktop has no physical-page query, so keep the
+    // caller's synthetic page. Real allocations use the era_physical path below.
+    constexpr ULONG_PTR observed_query_flags = 0x280;
+    if (flags == observed_query_flags) {
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
     return physical_result(era_physical::allocate(flags, reinterpret_cast<std::uint64_t*>(count),
                                                   reinterpret_cast<std::uint64_t*>(pages)));
 }
