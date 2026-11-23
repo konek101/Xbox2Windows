@@ -964,6 +964,10 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
                           static_cast<unsigned long long>(bytes),
                           static_cast<unsigned long long>(committed_bytes));
             write_log(line);
+            // Note: writing the clamped end back into the shared pool object is not safe here. The
+            // sampler heap is created after the CBV/SRV/UAV pool and is only a few KiB, so patching
+            // 0x75e7378 +0x10/+0x28 with that heap's end shrinks the shared bump limit and the
+            // title's allocator faults. Measured: crash moved from the GPU driver to +0x55ac264.
         }
     }
 
