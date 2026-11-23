@@ -762,16 +762,84 @@ constexpr std::size_t create_shader_resource_view_x_slot = 70;
 
 HRESULT WINAPI create_shader_resource_view_x(ProxyDevice* proxy,
                                              const D3D12_CPU_DESCRIPTOR_HANDLE* handle,
-                                             const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
-                                             ID3D12Resource* resource)
+                                             const void* desc_bytes, std::uint32_t format)
 {
-    (void)proxy;
-    (void)handle;
-    (void)desc;
-    (void)resource;
-    // Console slot 70 carries a console descriptor/format payload, not the desktop SRV ABI.
-    // Reporting success avoids the BVH builder's fatal E_NOTIMPL throw; the view is not emitted.
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!handle || !desc_bytes) return E_INVALIDARG;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    std::memcpy(&srv, desc_bytes, sizeof(srv));
+    srv.Format = static_cast<DXGI_FORMAT>(format);
+    auto* resource = *reinterpret_cast<ID3D12Resource* const*>(
+        static_cast<const unsigned char*>(desc_bytes) + 0x28);
+    if (!resource) return E_INVALIDARG;
+    proxy->real->CreateShaderResourceView(resource, &srv, *handle);
     return S_OK;
+}
+
+// Xbox slot 62 is measured as compute-PSO creation (root-signature pointer, DXBC blob, IID on the
+// stack, out on the stack), not desktop ID3D12Device5::CreateStateObject. The title's blob is Xbox
+// DXIL, so create a source-built no-op SM5 compute PSO to keep the object graph valid. The BVH
+// dispatches become no-ops until the package DXIL is retargeted.
+constexpr std::size_t create_compute_pipeline_state_x_slot = 62;
+
+struct noop_compute_shader {
+    ID3DBlob* blob = nullptr;
+    HRESULT result = E_FAIL;
+};
+
+const noop_compute_shader& noop_compute_shader_blob()
+{
+    static const noop_compute_shader shader = [] {
+        using d3dcompile_fn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR,
+                                              LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        noop_compute_shader value{};
+        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+        if (!compiler) return value;
+        const auto compile = reinterpret_cast<d3dcompile_fn>(
+            GetProcAddress(compiler, "D3DCompile"));
+        if (!compile) return value;
+        constexpr char source[] =
+            "[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) {}";
+        ID3DBlob* errors = nullptr;
+        value.result = compile(source, sizeof(source) - 1, "noop_compute", nullptr, nullptr,
+                               "main", "cs_5_0", 0, 0, &value.blob, &errors);
+        if (errors) errors->Release();
+        if (FAILED(value.result)) {
+            if (value.blob) {
+                value.blob->Release();
+                value.blob = nullptr;
+            }
+        }
+        return value;
+    }();
+    return shader;
+}
+
+HRESULT WINAPI create_compute_pipeline_state_x(
+    ProxyDevice* proxy, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, std::uintptr_t,
+    std::uintptr_t, const IID* iid, void** pipeline_state)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!desc || !pipeline_state) return E_POINTER;
+    *pipeline_state = nullptr;
+    const auto& shader = noop_compute_shader_blob();
+    if (FAILED(shader.result) || !shader.blob) return shader.result;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC safe = *desc;
+    if (!safe.NodeMask) safe.NodeMask = 1;
+    safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
+    safe.CachedPSO = {};
+    safe.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    const IID& requested = iid ? *iid : __uuidof(ID3D12PipelineState);
+    HRESULT result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
+    if (FAILED(result) && safe.pRootSignature) {
+        safe.pRootSignature = nullptr;
+        result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
+    }
+    char line[192];
+    std::snprintf(line, sizeof(line), "d3d12_xs: noop compute PSO -> 0x%08lx\n",
+                  static_cast<unsigned long>(result));
+    write_log(line);
+    return result;
 }
 
 ProxyDevice* create_proxy(ID3D12Device* real)
@@ -825,8 +893,8 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&configure_frame_event);
     proxy->vtable_memory[create_committed_resource_x_slot] =
         reinterpret_cast<void*>(&create_committed_resource_x);
-    proxy->vtable_memory[create_state_object_slot] =
-        reinterpret_cast<void*>(&create_state_object);
+    proxy->vtable_memory[create_compute_pipeline_state_x_slot] =
+        reinterpret_cast<void*>(&create_compute_pipeline_state_x);
     proxy->vtable_memory[create_shader_resource_view_x_slot] =
         reinterpret_cast<void*>(&create_shader_resource_view_x);
 
