@@ -784,6 +784,53 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
     return proxy;
 }
 
+// Measured at game RVA 0x247954e..0x2479646: the bring-up routine asks the device for command
+// signatures through slot 41 (0x148). The console indirect-argument type 0x69 (105) is rejected by
+// desktop D3D12 with E_INVALIDARG; its byte stride of 12 (3 x UINT) matches a dispatch signature, so
+// translate it to D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH. DRAW (0) and DRAW_INDEXED (1) pass through.
+constexpr std::size_t create_command_signature_slot = 41;
+constexpr std::uint32_t console_indirect_dispatch_type = 0x69u;
+constexpr UINT max_command_signature_args = 8;
+
+HRESULT WINAPI create_command_signature_x(ProxyDevice* proxy,
+                                          const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                          ID3D12RootSignature* root_signature, REFIID iid,
+                                          void** signature)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    if (!desc || !signature) return E_POINTER;
+    *signature = nullptr;
+
+    D3D12_COMMAND_SIGNATURE_DESC copy = *desc;
+    if (!copy.NodeMask) copy.NodeMask = 1;
+
+    D3D12_INDIRECT_ARGUMENT_DESC translated[max_command_signature_args]{};
+    if (copy.NumArgumentDescs && copy.pArgumentDescs) {
+        if (copy.NumArgumentDescs > max_command_signature_args) {
+            write_log("d3d12_xs: CreateCommandSignatureX too many argument descs -> E_INVALIDARG\n");
+            return E_INVALIDARG;
+        }
+        for (UINT index = 0; index < copy.NumArgumentDescs; ++index) {
+            translated[index] = copy.pArgumentDescs[index];
+            if (static_cast<std::uint32_t>(translated[index].Type) ==
+                console_indirect_dispatch_type) {
+                translated[index].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+            }
+        }
+        copy.pArgumentDescs = translated;
+    }
+
+    const HRESULT result =
+        proxy->real->CreateCommandSignature(&copy, root_signature, iid, signature);
+    char line[192];
+    std::snprintf(line, sizeof(line),
+                  "d3d12_xs: CreateCommandSignatureX stride=%u args=%u -> 0x%08lx\n",
+                  static_cast<unsigned>(copy.ByteStride), static_cast<unsigned>(copy.NumArgumentDescs),
+                  static_cast<unsigned long>(result));
+    write_log(line);
+    return result;
+}
+
 constexpr std::size_t create_descriptor_heap_slot = 14;
 constexpr UINT desktop_shader_visible_limit = 1'000'000;
 
@@ -1445,6 +1492,8 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_command_queue_x);
     proxy->vtable_memory[create_descriptor_heap_slot] =
         reinterpret_cast<void*>(&create_descriptor_heap);
+    proxy->vtable_memory[create_command_signature_slot] =
+        reinterpret_cast<void*>(&create_command_signature_x);
     proxy->vtable_memory[create_xbox_slot73_index] =
         reinterpret_cast<void*>(&create_xbox_command_list);
     proxy->vtable_memory[slot78_slot] = reinterpret_cast<void*>(&slot78_noop);
