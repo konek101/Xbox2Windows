@@ -390,6 +390,17 @@ HRESULT WINAPI set_frame_interval_x(ProxyDevice* proxy, std::uint32_t interval, 
     return S_OK;
 }
 
+// Observed post-map call at 0x1e8684c: Xbox device slot 0x428 (133), scalar/pointer arguments and
+// no measured out parameter. Desktop has no equivalent frame-event setup, so log and succeed.
+constexpr std::size_t configure_frame_event_slot = 133;
+
+HRESULT WINAPI configure_frame_event(ProxyDevice*, std::uintptr_t, std::uintptr_t,
+                                     std::uintptr_t, std::uintptr_t, std::uintptr_t,
+                                     std::uintptr_t)
+{
+    return S_OK;
+}
+
 // The measured title calls GDK CreateCommandQueueX at offset 0x180 (slot 48), before the desktop
 // Device1+ methods. Translate its Xbox queue descriptor to the desktop descriptor and use slot 8 of
 // the real device. Only the Type field is measured; priority/flags/node are desktop defaults.
@@ -464,6 +475,8 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_xbox_slot73);
     proxy->vtable_memory[set_frame_interval_x_slot] =
         reinterpret_cast<void*>(&set_frame_interval_x);
+    proxy->vtable_memory[configure_frame_event_slot] =
+        reinterpret_cast<void*>(&configure_frame_event);
 
     if (cursor != code + thunk_block_bytes) {
         VirtualFree(code, 0, MEM_RELEASE);
@@ -482,7 +495,7 @@ ProxyDevice* create_proxy(ID3D12Device* real)
     }
 
     proxy->thunk_memory = code;
-    proxy->references = 1;
+    proxy->references = 2; // one caller reference; one process-lifetime root reference
     proxy->real = real;
     return proxy;
 }
