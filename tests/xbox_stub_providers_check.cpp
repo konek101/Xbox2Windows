@@ -46,7 +46,7 @@ __declspec(dllimport) std::int32_t WINAPI XApuEnqueueCommand(void*, const void*,
 __declspec(dllimport) std::uint32_t WINAPI XApuGetResultCount(void*);
 
 // xg_xs.dll
-__declspec(dllimport) std::int32_t WINAPI XGCreateTextureComputer(const void*, void*);
+__declspec(dllimport) std::int32_t WINAPI XGCreateTextureComputer(const void*, void**);
 __declspec(dllimport) std::uint32_t WINAPI XGSuggestSwizzleMode(const void*);
 
 // xcrdapi.dll
@@ -141,13 +141,26 @@ bool bindings_resolve()
     return true;
 }
 
+// xg_xs returns a usable inert object: the title stores the out pointer and later calls a method
+// through its vtable. Null out is refused, success returns a non-null object owned by the module.
+bool texture_computer_object()
+{
+    void* object = nullptr;
+    if (XGCreateTextureComputer(nullptr, &object) != S_OK || !object) return false;
+    auto** vtable = *reinterpret_cast<void***>(object);
+    if (!vtable) return false;
+    using release = std::uint32_t(WINAPI*)(void*);
+    reinterpret_cast<release>(vtable[2])(object);
+    return XGCreateTextureComputer(nullptr, nullptr) == E_POINTER;
+}
+
 bool applies_desktop_policy()
 {
     return same_bits(AcpHalCreate(nullptr, nullptr)) &&
            same_bits(XDspActivate(nullptr, nullptr)) &&
            same_bits(XApuConnect(nullptr, nullptr)) &&
            XApuGetResultCount(nullptr) == 0 &&
-           same_bits(XGCreateTextureComputer(nullptr, nullptr)) &&
+           texture_computer_object() &&
            XGSuggestSwizzleMode(nullptr) == 0 &&
            same_bits(XMemTransferMemory(0, 0, 0, 0)) &&
            XMemIsToolsMemAvailable() == FALSE &&
