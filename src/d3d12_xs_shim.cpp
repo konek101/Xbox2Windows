@@ -1109,6 +1109,16 @@ constexpr replacement_shader_entry replacement_shaders[] = {
      "InitPartitionedHeaders"},
     {0x1488, 0x40891c36f2e1e8aaull, L"init_headers.signed.dxil", "InitHeaders"},
     {0x1118, 0x244fbfb4d63958bfull, L"pt_begin_pass.signed.dxil", "PT_BeginPass"},
+    // Containers that use no xbox.* intrinsics: retarget + sign only, no source rewrite.
+    {0x1134, 0x9e3107c7a215e9e9ull, L"copy_and_compact_bvh.signed.dxil", "CopyAndCompactBVH"},
+    {0x1194, 0x999c5fa5f4f5d83cull, L"decompress_header.signed.dxil", "DecompressHeader"},
+    {0x10d0, 0x49491fe19cf20422ull, L"reset_kdop.signed.dxil", "ResetKDOP"},
+    {0x5e60, 0x4e7a3ffdba738043ull, L"pt_construct_bvh4.signed.dxil", "PT_ConstructBVH4"},
+    {0x0fec, 0xab39445dd0120e52ull, L"radix_reset.signed.dxil", "RadixReset"},
+    {0x10e8, 0xef0d378acaeb428eull, L"copy_counters.signed.dxil", "CopyCounters"},
+    {0x1004, 0xf7b2f1886df21ee6ull, L"reset_to_index_buffer.signed.dxil", "ResetToIndexBuffer"},
+    {0x126c, 0x83225f64b531e807ull, L"copy_for_bvh_update.signed.dxil", "CopyForBVHUpdate"},
+    {0x0fe8, 0x20c629c82e9687b4ull, L"reset_counter_values.signed.dxil", "ResetCounterValues"},
 };
 constexpr std::size_t replacement_shader_count =
     sizeof(replacement_shaders) / sizeof(replacement_shaders[0]);
@@ -1290,7 +1300,7 @@ bool ensure_replacement_resources(ProxyDevice* proxy)
     if (!proxy->replacement_resources_attempted) {
         proxy->replacement_resources_attempted = true;
 
-        D3D12_ROOT_PARAMETER parameters[3]{};
+        D3D12_ROOT_PARAMETER parameters[17]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         parameters[0].Descriptor.ShaderRegister = 0;
         parameters[0].Descriptor.RegisterSpace = 0;
@@ -1307,8 +1317,28 @@ bool ensure_replacement_resources(ProxyDevice* proxy)
         parameters[2].Constants.Num32BitValues = 16;
         parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+        // Parameters 3..16 cover the remaining SRV/UAV registers the recompiled console shaders
+        // declare (up to t7 and u7). A pipeline state only needs the registers to be present in the
+        // root signature, so this wide layout lets the retarget+sign-only shaders create real
+        // desktop PSOs even though their dispatch bindings are not translated yet.
+        std::size_t next_parameter = 3;
+        for (UINT reg = 1; reg < 8; ++reg) {
+            D3D12_ROOT_PARAMETER& srv = parameters[next_parameter++];
+            srv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            srv.Descriptor.ShaderRegister = reg;
+            srv.Descriptor.RegisterSpace = 0;
+            srv.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        for (UINT reg = 1; reg < 8; ++reg) {
+            D3D12_ROOT_PARAMETER& uav = parameters[next_parameter++];
+            uav.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            uav.Descriptor.ShaderRegister = reg;
+            uav.Descriptor.RegisterSpace = 0;
+            uav.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+
         D3D12_ROOT_SIGNATURE_DESC root_desc{};
-        root_desc.NumParameters = 3;
+        root_desc.NumParameters = static_cast<UINT>(next_parameter);
         root_desc.pParameters = parameters;
         root_desc.NumStaticSamplers = 0;
         root_desc.pStaticSamplers = nullptr;
@@ -1621,10 +1651,23 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     // The console parameter block is not interpreted. The observed call passes adapter=null; a
     // non-null adapter could be an Xbox wrapper with an unknown ABI, so desktop D3D12 picks the
     // default adapter instead of forwarding it.
+    // The console compute shaders are Shader Model 6.5, which needs a D3D12_2-capable device; a
+    // FL12_0 device rejects their pipeline states with E_INVALIDARG. Prefer the highest feature
+    // level the adapter reports and fall back gracefully.
     ID3D12Device* real_device = nullptr;
-    const HRESULT create_hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0,
-                                                __uuidof(ID3D12Device),
-                                                reinterpret_cast<void**>(&real_device));
+    HRESULT create_hr = E_FAIL;
+    D3D_FEATURE_LEVEL created_level = D3D_FEATURE_LEVEL_12_0;
+    const D3D_FEATURE_LEVEL levels_to_try[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
+                                                D3D_FEATURE_LEVEL_12_0};
+    for (D3D_FEATURE_LEVEL level : levels_to_try) {
+        create_hr = D3D12CreateDevice(nullptr, level, __uuidof(ID3D12Device),
+                                      reinterpret_cast<void**>(&real_device));
+        if (SUCCEEDED(create_hr) && real_device) {
+            created_level = level;
+            break;
+        }
+        real_device = nullptr;
+    }
     if (FAILED(create_hr) || !real_device) {
         std::snprintf(line, sizeof(line), "d3d12_xs: D3D12CreateDevice failed hr=0x%08lx\n",
                       static_cast<unsigned long>(create_hr));
@@ -1636,8 +1679,8 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     const HRESULT feature_hr = real_device->CheckFeatureSupport(
         D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5));
     std::snprintf(line, sizeof(line),
-                  "d3d12_xs: device raytracing tier=%u feature_hr=0x%08lx\n",
-                  static_cast<unsigned>(options5.RaytracingTier),
+                  "d3d12_xs: device level=0x%x raytracing tier=%u feature_hr=0x%08lx\n",
+                  static_cast<unsigned>(created_level), static_cast<unsigned>(options5.RaytracingTier),
                   static_cast<unsigned long>(feature_hr));
     write_log(line);
     sync_cached_descriptor_increment(real_device);
