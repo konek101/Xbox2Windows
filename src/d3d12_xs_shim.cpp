@@ -87,6 +87,11 @@ struct ProxyDevice {
     std::uintptr_t descriptor_legacy_base;
     std::uintptr_t descriptor_real_cpu;
     std::uintptr_t descriptor_real_gpu;
+    // Pipeline states this shim created (replacement or no-op stand-in). A dispatch bound to one of
+    // them is clamped, because the title's console-sized grids would otherwise run for seconds and
+    // trip the driver's timeout detection (measured: DXGI_ERROR_DEVICE_REMOVED).
+    void* shim_pso[64];
+    volatile LONG shim_pso_count;
 };
 
 constexpr std::size_t forward_thunk_bytes = 23;
@@ -346,6 +351,7 @@ struct XsCommandListProxy {
     bool replacement_active;   // the replacement root signature is currently bound.
     bool logged_root_constants; // diagnostic: first root-constant payload has been logged.
     ID3D12RootSignature* requested_root_signature; // last non-replacement root signature.
+    bool shim_pso_bound;       // current pipeline state was created by this shim.
 };
 
 void destroy_command_list_proxy(XsCommandListProxy* proxy)
@@ -415,6 +421,31 @@ HRESULT WINAPI command_list_unimplemented(XsCommandListProxy* self, std::uintptr
 // replacement PSO is selected after the title already bound its own root signature, re-apply the
 // desktop replacement root signature; if the list leaves the replacement PSO, restore the title's
 // last requested root signature.
+// Slot 14 Dispatch. When the bound pipeline state is a shim stand-in, the title's console-sized
+// thread grid would keep the GPU busy long enough to trigger the driver timeout, which removes the
+// device. Submit a single group instead so the placeholders stay cheap.
+constexpr std::size_t command_list_dispatch_slot = 14;
+
+void WINAPI command_list_dispatch(XsCommandListProxy* proxy, UINT x, UINT y, UINT z)
+{
+    if (!proxy || !proxy->real_list) return;
+    auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
+    if (proxy->shim_pso_bound) {
+        static volatile LONG logged = 0;
+        if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: clamping shim dispatch (%u,%u,%u) -> (1,1,1)\n",
+                          static_cast<unsigned>(x), static_cast<unsigned>(y),
+                          static_cast<unsigned>(z));
+            write_log(line);
+        }
+        real->Dispatch(1, 1, 1);
+        return;
+    }
+    real->Dispatch(x, y, z);
+}
+
 void WINAPI command_list_set_pipeline_state(XsCommandListProxy* proxy, ID3D12PipelineState* pso)
 {
     auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
@@ -423,6 +454,16 @@ void WINAPI command_list_set_pipeline_state(XsCommandListProxy* proxy, ID3D12Pip
     ProxyDevice* device = proxy->device_proxy;
     const bool replacement_pso =
         device && device->replacement_pso && pso == device->replacement_pso;
+    proxy->shim_pso_bound = false;
+    if (device) {
+        const LONG count = device->shim_pso_count;
+        for (LONG index = 0; index < count && index < 64; ++index) {
+            if (device->shim_pso[index] == pso) {
+                proxy->shim_pso_bound = true;
+                break;
+            }
+        }
+    }
     if (replacement_pso && device->replacement_root_signature) {
         real->SetComputeRootSignature(device->replacement_root_signature);
         proxy->replacement_active = true;
@@ -581,6 +622,8 @@ XsCommandListProxy* create_command_list_proxy(void* real_list, ProxyDevice* devi
     proxy->vtable_memory[7] = reinterpret_cast<void*>(&command_list_get_device);
     proxy->vtable_memory[command_list_set_pipeline_state_slot] =
         reinterpret_cast<void*>(&command_list_set_pipeline_state);
+    proxy->vtable_memory[command_list_dispatch_slot] =
+        reinterpret_cast<void*>(&command_list_dispatch);
     proxy->vtable_memory[command_list_set_compute_root_signature_slot] =
         reinterpret_cast<void*>(&command_list_set_compute_root_signature);
     proxy->vtable_memory[command_list_set_compute_root_uav_slot] =
@@ -1717,6 +1760,10 @@ HRESULT WINAPI create_compute_pipeline_state_x(
                   static_cast<unsigned long long>(desc->CS.BytecodeLength),
                   static_cast<unsigned long long>(incoming_hash), replacement_target ? 1 : 0);
     write_log(line);
+    if (SUCCEEDED(result) && *pipeline_state) {
+        const LONG slot = InterlockedIncrement(&proxy->shim_pso_count) - 1;
+        if (slot >= 0 && slot < 64) proxy->shim_pso[slot] = *pipeline_state;
+    }
     return result;
 }
 
