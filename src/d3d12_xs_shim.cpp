@@ -1226,6 +1226,19 @@ HRESULT WINAPI create_shader_resource_view_x(ProxyDevice* proxy, const void* sou
             write_log(line);
         }
     }
+    // The console call carries a console view payload that is not a desktop SRV description, so the
+    // slot cannot be translated faithfully yet. Leaving it unwritten leaves whatever the descriptor
+    // slot held, which the driver later reads as a null T#. Emit a valid default SRV of the shim
+    // buffer instead, so every descriptor the title binds is well formed.
+    if (proxy && proxy->real && proxy->replacement_uav && destination) {
+        std::uintptr_t target = reinterpret_cast<std::uintptr_t>(destination);
+        if (proxy->descriptor_legacy_base && proxy->descriptor_real_cpu &&
+            target >= proxy->descriptor_legacy_base) {
+            target = proxy->descriptor_real_cpu + (target - proxy->descriptor_legacy_base);
+        }
+        proxy->real->CreateShaderResourceView(proxy->replacement_uav, nullptr,
+                                              D3D12_CPU_DESCRIPTOR_HANDLE{target});
+    }
     return S_OK;
 }
 
