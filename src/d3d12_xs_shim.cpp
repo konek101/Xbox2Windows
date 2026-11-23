@@ -985,9 +985,24 @@ const noop_compute_shader& noop_compute_shader_blob()
 // bytes are never embedded in this file. They are read once from BVH_SHADER_DIR when that variable
 // is set, otherwise from the directory containing d3d12_xs.dll, and then cached for the process.
 // ---------------------------------------------------------------------------------------------
-constexpr SIZE_T init_partitioned_headers_length = 0x1410;
-constexpr std::uint64_t init_partitioned_headers_fnv1a64 = 0x1e3c95fd4232f377ull;
-constexpr wchar_t replacement_shader_file_name[] = L"init_partitioned_headers.signed.dxil";
+struct replacement_shader_entry {
+    SIZE_T length;
+    std::uint64_t fnv1a64;
+    const wchar_t* file_name;
+    const char* label;
+};
+
+// Console shader containers that have a source-built desktop replacement. The key is the container
+// byte length plus the FNV-1a 64 of the container bytes; the replacement file lives in
+// BVH_SHADER_DIR (or next to d3d12_xs.dll) and is never shipped in the repository.
+constexpr replacement_shader_entry replacement_shaders[] = {
+    {0x1410, 0x1e3c95fd4232f377ull, L"init_partitioned_headers.signed.dxil",
+     "InitPartitionedHeaders"},
+    {0x1488, 0x40891c36f2e1e8aaull, L"init_headers.signed.dxil", "InitHeaders"},
+    {0x1118, 0x244fbfb4d63958bfull, L"pt_begin_pass.signed.dxil", "PT_BeginPass"},
+};
+constexpr std::size_t replacement_shader_count =
+    sizeof(replacement_shaders) / sizeof(replacement_shaders[0]);
 constexpr wchar_t replacement_shader_dir_variable[] = L"BVH_SHADER_DIR";
 constexpr DWORD max_replacement_shader_bytes = 64u * 1024u * 1024u;
 constexpr DWORD replacement_path_capacity = 32768;
@@ -1003,12 +1018,26 @@ std::uint64_t fnv1a64(const void* data, SIZE_T size)
     return hash;
 }
 
-bool is_init_partitioned_headers(const D3D12_SHADER_BYTECODE& shader)
+// Returns the registry index of a shader with a desktop replacement, or -1.
+int find_replacement_shader(const D3D12_SHADER_BYTECODE& shader)
 {
-    return shader.pShaderBytecode != nullptr &&
-           shader.BytecodeLength == init_partitioned_headers_length &&
-           fnv1a64(shader.pShaderBytecode, shader.BytecodeLength) ==
-               init_partitioned_headers_fnv1a64;
+    if (shader.pShaderBytecode == nullptr) return -1;
+    bool length_known = false;
+    for (std::size_t index = 0; index < replacement_shader_count; ++index) {
+        if (replacement_shaders[index].length == shader.BytecodeLength) {
+            length_known = true;
+            break;
+        }
+    }
+    if (!length_known) return -1;
+    const std::uint64_t hash = fnv1a64(shader.pShaderBytecode, shader.BytecodeLength);
+    for (std::size_t index = 0; index < replacement_shader_count; ++index) {
+        if (replacement_shaders[index].length == shader.BytecodeLength &&
+            replacement_shaders[index].fnv1a64 == hash) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
 }
 
 struct replacement_shader_cache {
@@ -1017,7 +1046,7 @@ struct replacement_shader_cache {
     SIZE_T size = 0;
 };
 
-replacement_shader_cache replacement_shader;
+replacement_shader_cache replacement_shader_slots[replacement_shader_count];
 SRWLOCK replacement_shader_lock = SRWLOCK_INIT;
 
 bool get_shim_directory(wchar_t* directory, DWORD capacity)
@@ -1040,14 +1069,15 @@ bool get_shim_directory(wchar_t* directory, DWORD capacity)
     return true;
 }
 
-bool build_replacement_path(const wchar_t* directory, wchar_t* path, DWORD capacity)
+bool build_replacement_path(const wchar_t* directory, const wchar_t* file_name, wchar_t* path,
+                            DWORD capacity)
 {
     SIZE_T length = 0;
     while (directory[length] != L'\0') ++length;
     if (length == 0) return false;
     const bool needs_separator = directory[length - 1] != L'\\' && directory[length - 1] != L'/';
-    return swprintf_s(path, capacity, needs_separator ? L"%s\\%s" : L"%s%s", directory,
-                      replacement_shader_file_name) > 0;
+    return swprintf_s(path, capacity, needs_separator ? L"%s\\%s" : L"%s%s", directory, file_name) >
+           0;
 }
 
 bool read_replacement_shader(const wchar_t* path, replacement_shader_cache& cache)
@@ -1099,11 +1129,14 @@ bool read_replacement_shader(const wchar_t* path, replacement_shader_cache& cach
     return true;
 }
 
-const replacement_shader_cache& replacement_shader_blob()
+const replacement_shader_cache& replacement_shader_blob(int index)
 {
+    static const replacement_shader_cache empty{};
+    if (index < 0 || static_cast<std::size_t>(index) >= replacement_shader_count) return empty;
+    replacement_shader_cache& slot = replacement_shader_slots[index];
     AcquireSRWLockExclusive(&replacement_shader_lock);
-    if (!replacement_shader.attempted) {
-        replacement_shader.attempted = true;
+    if (!slot.attempted) {
+        slot.attempted = true;
         wchar_t directory[replacement_path_capacity];
         const DWORD env_length = GetEnvironmentVariableW(
             replacement_shader_dir_variable, directory, replacement_path_capacity);
@@ -1116,9 +1149,9 @@ const replacement_shader_cache& replacement_shader_blob()
             }
         }
         wchar_t path[replacement_path_capacity];
-        if (have_directory &&
-            build_replacement_path(directory, path, replacement_path_capacity)) {
-            read_replacement_shader(path, replacement_shader);
+        if (have_directory && build_replacement_path(directory, replacement_shaders[index].file_name,
+                                                    path, replacement_path_capacity)) {
+            read_replacement_shader(path, slot);
         } else if (have_directory) {
             write_log("d3d12_xs: BVH replacement shader path is too long -> noop\n");
         } else if (env_length == 0) {
@@ -1126,7 +1159,7 @@ const replacement_shader_cache& replacement_shader_blob()
         }
     }
     ReleaseSRWLockExclusive(&replacement_shader_lock);
-    return replacement_shader;
+    return slot;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1148,7 +1181,7 @@ bool ensure_replacement_resources(ProxyDevice* proxy)
     if (!proxy->replacement_resources_attempted) {
         proxy->replacement_resources_attempted = true;
 
-        D3D12_ROOT_PARAMETER parameters[2]{};
+        D3D12_ROOT_PARAMETER parameters[3]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
         parameters[0].Descriptor.ShaderRegister = 0;
         parameters[0].Descriptor.RegisterSpace = 0;
@@ -1157,9 +1190,16 @@ bool ensure_replacement_resources(ProxyDevice* proxy)
         parameters[1].Descriptor.ShaderRegister = 0;
         parameters[1].Descriptor.RegisterSpace = 0;
         parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // The L1 BVH layouts also bind 16 root constants at b0; the desktop replacements read the
+        // same block (for example the header count and the console BVH base address).
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[2].Constants.ShaderRegister = 0;
+        parameters[2].Constants.RegisterSpace = 0;
+        parameters[2].Constants.Num32BitValues = 16;
+        parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC root_desc{};
-        root_desc.NumParameters = 2;
+        root_desc.NumParameters = 3;
         root_desc.pParameters = parameters;
         root_desc.NumStaticSamplers = 0;
         root_desc.pStaticSamplers = nullptr;
@@ -1254,10 +1294,11 @@ HRESULT WINAPI create_compute_pipeline_state_x(
     const auto& shader = noop_compute_shader_blob();
     const bool noop_ready = SUCCEEDED(shader.result) && shader.blob;
 
-    const bool replacement_target = is_init_partitioned_headers(desc->CS);
+    const int replacement_index = find_replacement_shader(desc->CS);
+    const bool replacement_target = replacement_index >= 0;
     const replacement_shader_cache* replacement = nullptr;
     if (replacement_target) {
-        const replacement_shader_cache& cached = replacement_shader_blob();
+        const replacement_shader_cache& cached = replacement_shader_blob(replacement_index);
         if (cached.bytes && cached.size && ensure_replacement_resources(proxy)) {
             replacement = &cached;
         }
