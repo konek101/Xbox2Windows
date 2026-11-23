@@ -939,6 +939,40 @@ HRESULT WINAPI create_command_queue_x(ProxyDevice* proxy, const void* desc, REFI
 // entry inserts three extra arguments after the desktop clear value, then supplies IID and out.
 // RCX=proxy, RDX=heap properties, R8D=heap flags, R9=resource desc, stack: initial state, clear
 // value, three console-only args, REFIID, out. Translate to desktop CreateCommittedResource.
+// Measured immediately before the current fault: the title calls device slot 61 (desktop
+// ID3D12Device5::CreateMetaCommand) and an appended slot 86 on the proxy, both failing closed. The
+// console meta-command payload is not yet identified, so record the first call's arguments instead
+// of guessing. Behaviour is unchanged (E_NOTIMPL).
+constexpr std::size_t create_meta_command_slot = 61;
+
+HRESULT WINAPI create_meta_command(ProxyDevice* proxy, const void* desc, std::uintptr_t,
+                                   std::uintptr_t, REFIID, void** out)
+{
+    static volatile LONG logged = 0;
+    if (InterlockedCompareExchange(&logged, 1, 0) == 0) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "d3d12_xs: slot61 CreateMetaCommand desc=%p out=%p\n",
+                      const_cast<void*>(desc), out);
+        write_log(line);
+        if (desc) {
+            const auto* bytes = static_cast<const unsigned char*>(desc);
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: slot61 desc %02x%02x%02x%02x %02x%02x%02x%02x "
+                          "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                          "%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                          bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                          bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19], bytes[20],
+                          bytes[21], bytes[22], bytes[23], bytes[24], bytes[25], bytes[26], bytes[27],
+                          bytes[28], bytes[29], bytes[30], bytes[31]);
+            write_log(line);
+        }
+    }
+    if (out) *static_cast<void**>(out) = nullptr;
+    (void)proxy;
+    return E_NOTIMPL;
+}
+
 constexpr std::size_t create_committed_resource_x_slot = 127;
 
 HRESULT WINAPI create_committed_resource_x(
@@ -1553,6 +1587,8 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_descriptor_heap);
     proxy->vtable_memory[create_command_signature_slot] =
         reinterpret_cast<void*>(&create_command_signature_x);
+    proxy->vtable_memory[create_meta_command_slot] =
+        reinterpret_cast<void*>(&create_meta_command);
     proxy->vtable_memory[create_xbox_slot73_index] =
         reinterpret_cast<void*>(&create_xbox_command_list);
     proxy->vtable_memory[slot78_slot] = reinterpret_cast<void*>(&slot78_noop);
