@@ -760,19 +760,9 @@ HRESULT WINAPI create_state_object(ProxyDevice* proxy, const D3D12_STATE_OBJECT_
 // R8 = D3D12_SHADER_RESOURCE_VIEW_DESC*, R9 = ID3D12Resource*. Translate to desktop slot 18.
 constexpr std::size_t create_shader_resource_view_x_slot = 70;
 
-HRESULT WINAPI create_shader_resource_view_x(ProxyDevice* proxy,
-                                             const D3D12_CPU_DESCRIPTOR_HANDLE* handle,
-                                             const void* desc_bytes, std::uint32_t format)
+HRESULT WINAPI create_shader_resource_view_x(ProxyDevice*, const D3D12_CPU_DESCRIPTOR_HANDLE*,
+                                             const void*, std::uint32_t)
 {
-    if (!proxy || !proxy->real) return E_UNEXPECTED;
-    if (!handle || !desc_bytes) return E_INVALIDARG;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    std::memcpy(&srv, desc_bytes, sizeof(srv));
-    srv.Format = static_cast<DXGI_FORMAT>(format);
-    auto* resource = *reinterpret_cast<ID3D12Resource* const*>(
-        static_cast<const unsigned char*>(desc_bytes) + 0x28);
-    if (!resource) return E_INVALIDARG;
-    proxy->real->CreateShaderResourceView(resource, &srv, *handle);
     return S_OK;
 }
 
