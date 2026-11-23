@@ -26,6 +26,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <memoryapi.h>
 
 namespace {
 // The BVH callers' query buffer. era_query writes at most its first 0x31 bytes.
@@ -43,6 +44,23 @@ constexpr std::size_t gpu_usage_offset = 8;
 
 // HRESULT E_NOTIMPL for the loader-gap exports that have no desktop implementation.
 constexpr std::int32_t not_implemented = static_cast<std::int32_t>(0x80004001u);
+
+// VirtualAlloc2 is not in the default import library on every SDK; resolve it dynamically.
+using virtual_alloc2_fn = void* (WINAPI*)(HANDLE, void*, SIZE_T, ULONG, ULONG, void*, ULONG);
+
+virtual_alloc2_fn resolve_virtual_alloc2() noexcept
+{
+    static const auto resolved = []() -> virtual_alloc2_fn {
+        for (const wchar_t* module_name : {L"kernel32.dll", L"kernelbase.dll"}) {
+            HMODULE module = GetModuleHandleW(module_name);
+            if (!module) continue;
+            const auto proc = GetProcAddress(module, "VirtualAlloc2");
+            if (proc) return reinterpret_cast<virtual_alloc2_fn>(proc);
+        }
+        return nullptr;
+    }();
+    return resolved;
+}
 }
 
 extern "C" void* XMemAlloc(SIZE_T bytes, ULONGLONG attributes)
@@ -135,10 +153,13 @@ extern "C" BOOL WINAPI XMemIsToolsMemAvailable()
 }
 
 // XMemVirtualAlloc(address, size, flAllocationType, XMemFlags, flProtect). The observed recorder
-// passes 0x20402000/0x21/0x4 and 0x20402000/0x3/0x801. The Xbox allocation type and protection
-// carry console page-size and mapping bits that desktop VirtualAlloc rejects. Keep the standard
-// reserve/commit state and a valid base protection so the title's multi-gigabyte reservations
-// succeed. The XMemFlags page-kind details are not modeled here.
+// passes 0x20402000/0x21/0x4 and 0x20402000/0x3/0x801. The title's GPU pool builder additionally
+// uses placeholder reservations: 0x42000 (MEM_RESERVE|MEM_RESERVE_PLACEHOLDER) followed by
+// VirtualFree(..., MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER) and 0x20406000
+// (MEM_64K_PAGES|MEM_REPLACE_PLACEHOLDER|MEM_RESERVE). Preserve those bits through VirtualAlloc2;
+// dropping them makes the title's split/replace sequence fail with ERROR_INVALID_ADDRESS. The
+// console-only page-kind bits are not modeled, and non-placeholder callers keep the ordinary
+// VirtualAlloc mapping.
 extern "C" void* XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_type,
                                   ULONGLONG /*flags*/, DWORD protect)
 {
@@ -146,14 +167,27 @@ extern "C" void* XMemVirtualAlloc(void* address, SIZE_T bytes, DWORD allocation_
     constexpr DWORD commit = 0x00001000;
     constexpr DWORD reset = 0x00080000;
     constexpr DWORD top_down = 0x00100000;
+    DWORD base_protect = protect & 0xFFu;
+    if (!base_protect) base_protect = PAGE_READWRITE;
+    if (allocation_type & (MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)) {
+        const auto alloc2 = resolve_virtual_alloc2();
+        if (!alloc2) {
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return nullptr;
+        }
+        if (allocation_type & MEM_RESERVE_PLACEHOLDER) {
+            return alloc2(GetCurrentProcess(), address, bytes,
+                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        }
+        return alloc2(GetCurrentProcess(), address, bytes,
+                      MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, base_protect, nullptr, 0);
+    }
     DWORD type = 0;
     if (allocation_type & reserve) type |= MEM_RESERVE;
     if (allocation_type & commit) type |= MEM_COMMIT;
     if (allocation_type & reset) type |= MEM_RESET;
     if (allocation_type & top_down) type |= MEM_TOP_DOWN;
     if (!type) type = MEM_RESERVE;
-    DWORD base_protect = protect & 0xFFu;
-    if (!base_protect) base_protect = PAGE_READWRITE;
     if (!(type & MEM_COMMIT)) base_protect = PAGE_NOACCESS;
     return VirtualAlloc(address, bytes, type, base_protect);
 }
