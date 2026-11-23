@@ -1170,6 +1170,23 @@ HRESULT WINAPI create_sampler_x(ProxyDevice* proxy, const void* desc, std::uintp
     return S_OK;
 }
 
+// Desktop slot 37 GetDeviceRemovedReason is otherwise forwarded silently, which hides the reason the
+// driver detached. Record it so a removed-device state is diagnosable.
+constexpr std::size_t get_device_removed_reason_slot = 37;
+
+HRESULT WINAPI get_device_removed_reason(ProxyDevice* proxy)
+{
+    if (!proxy || !proxy->real) return E_UNEXPECTED;
+    const HRESULT reason = proxy->real->GetDeviceRemovedReason();
+    if (FAILED(reason)) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "d3d12_xs: GetDeviceRemovedReason -> 0x%08lx\n",
+                      static_cast<unsigned long>(reason));
+        write_log(line);
+    }
+    return reason;
+}
+
 constexpr std::size_t create_committed_resource_x_slot = 127;
 
 HRESULT WINAPI create_committed_resource_x(
@@ -1810,6 +1827,8 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_command_queue_x);
     proxy->vtable_memory[create_descriptor_heap_slot] =
         reinterpret_cast<void*>(&create_descriptor_heap);
+    proxy->vtable_memory[get_device_removed_reason_slot] =
+        reinterpret_cast<void*>(&get_device_removed_reason);
     proxy->vtable_memory[create_command_signature_slot] =
         reinterpret_cast<void*>(&create_command_signature_x);
     proxy->vtable_memory[create_meta_command_slot] =
