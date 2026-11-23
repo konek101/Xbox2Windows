@@ -72,6 +72,16 @@ struct ProxyDevice {
     ID3D12Device* real;      // +16 owned desktop device (offset used by the thunks).
     void* thunk_memory;      // executable thunk block.
     void** vtable_memory;    // backing storage for `vtable`.
+
+    // Step 3b replacement binding objects. They are created once under this lock and stay
+    // valid for the proxy lifetime; the replacement PSO and the command-list proxy both
+    // reference them. The borrowed pointers below are owned by the title, not by the shim.
+    SRWLOCK replacement_resources_lock;
+    bool replacement_resources_attempted;
+    ID3D12RootSignature* replacement_root_signature; // SRV t0 at parameter 0, UAV u0 at 1.
+    ID3D12Resource* replacement_uav;                 // 16 MiB dummy, state UNORDERED_ACCESS.
+    ID3D12PipelineState* replacement_pso;            // borrowed: the created replacement PSO.
+    ID3D12RootSignature* replacement_game_root_signature; // borrowed: desc->pRootSignature.
 };
 
 constexpr std::size_t forward_thunk_bytes = 23;
@@ -127,6 +137,8 @@ void format_iid(const GUID& iid, char* out, std::size_t size)
 void destroy_proxy(ProxyDevice* proxy)
 {
     if (proxy->real) proxy->real->Release();
+    if (proxy->replacement_uav) proxy->replacement_uav->Release();
+    if (proxy->replacement_root_signature) proxy->replacement_root_signature->Release();
     if (proxy->thunk_memory) VirtualFree(proxy->thunk_memory, 0, MEM_RELEASE);
     delete[] proxy->vtable_memory;
     delete proxy;
@@ -247,13 +259,20 @@ std::uint8_t* emit_xbox_stub(std::uint8_t* code, std::uintptr_t slot, const void
 //   * Slots 0..2 implement QueryInterface/AddRef/Release. QueryInterface answers the console
 //     command-list IID, IID_ID3D12GraphicsCommandList6 (when the SDK declares it),
 //     IID_ID3D12GraphicsCommandList and IUnknown.
-//   * Slots 3..27 are the fixed base ID3D12GraphicsCommandList methods (3 IUnknown + 4
-//     ID3D12Object + 1 ID3D12DeviceChild + 1 ID3D12CommandList + 18 ID3D12GraphicsCommandList),
-//     including slot 9 Close. Each slot is a generated x64 thunk that swaps the proxy `this` for
-//     the real desktop list and tail-jumps to the same desktop vtable slot.
-//   * Slots 28..255 are console reordering / unknown methods. Their stubs log the slot and return
+//   * Slots 3..41 are the fixed base ID3D12GraphicsCommandList methods (3 IUnknown + 4
+//     ID3D12Object + 1 ID3D12DeviceChild + 1 ID3D12CommandList + 32 ID3D12GraphicsCommandList),
+//     including slot 9 Close, slot 14 Dispatch and every compute root binding. Each slot is a
+//     generated x64 thunk that swaps the proxy `this` for the real desktop list and tail-jumps to
+//     the same desktop vtable slot.
+//   * Slot 25 SetPipelineState, slot 29 SetComputeRootSignature and slot 41
+//     SetComputeRootUnorderedAccessView instead run shim handlers. They track whether the list is
+//     executing the replacement PSO, substitute the desktop replacement root signature for the
+//     title's root signature, and bind the dummy UAV at parameter 1. The other root methods
+//     (descriptor table 28/31, SRV 39, Dispatch 14) are forwarded unchanged.
+//   * Slots 42..255 are console reordering / unknown methods. Their stubs log the slot and return
 //     E_NOTIMPL, except the measured tail calls slot 131 (0x418) and slot 132 (0x420), which have
 //     no out parameter and whose return values are ignored: those log and return S_OK.
+//     Everything from 42 upward stays fail-closed; no console-only slot is forwarded.
 //
 // The real list is released when the proxy refcount reaches zero. One proxy is created per
 // CreateCommandListX call; nothing here is a singleton.
@@ -280,7 +299,7 @@ static_assert(offsetof(XboxCommandListDesc, node_mask) == 8, "nodeMask is at +8"
 
 constexpr std::size_t command_list_vtable_slots = 256;
 constexpr std::size_t command_list_forward_first = 3;
-constexpr std::size_t command_list_forward_last = 27;
+constexpr std::size_t command_list_forward_last = 41;
 constexpr std::size_t command_list_stub_first = command_list_forward_last + 1;
 constexpr std::size_t command_list_forward_count =
     command_list_forward_last - command_list_forward_first + 1;
@@ -288,6 +307,19 @@ constexpr std::size_t command_list_stub_count =
     command_list_vtable_slots - command_list_stub_first;
 constexpr std::size_t command_list_thunk_block_bytes =
     forward_thunk_bytes * command_list_forward_count + xbox_stub_bytes * command_list_stub_count;
+// Desktop ID3D12GraphicsCommandList slots re-implemented by the shim.
+constexpr std::size_t command_list_set_pipeline_state_slot = 25;
+constexpr std::size_t command_list_set_compute_root_signature_slot = 29;
+constexpr std::size_t command_list_set_compute_root_uav_slot = 41;
+static_assert(command_list_set_pipeline_state_slot >= command_list_forward_first &&
+                  command_list_set_pipeline_state_slot <= command_list_forward_last,
+              "SetPipelineState must be inside the forwarded range");
+static_assert(command_list_set_compute_root_signature_slot >= command_list_forward_first &&
+                  command_list_set_compute_root_signature_slot <= command_list_forward_last,
+              "SetComputeRootSignature must be inside the forwarded range");
+static_assert(command_list_set_compute_root_uav_slot >= command_list_forward_first &&
+                  command_list_set_compute_root_uav_slot <= command_list_forward_last,
+              "SetComputeRootUnorderedAccessView must be inside the forwarded range");
 constexpr std::size_t command_list_tail_slot_131 = 0x418 / sizeof(void*);
 constexpr std::size_t command_list_tail_slot_132 = 0x420 / sizeof(void*);
 static_assert(command_list_tail_slot_131 == 131, "0x418 is slot 131");
@@ -302,6 +334,8 @@ struct XsCommandListProxy {
     ProxyDevice* device_proxy; // +24 owning device proxy returned by GetDevice.
     void* thunk_memory;        // executable thunk block.
     void** vtable_memory;      // backing storage for `vtable`.
+    bool replacement_active;   // the replacement root signature is currently bound.
+    ID3D12RootSignature* requested_root_signature; // last non-replacement root signature.
 };
 
 void destroy_command_list_proxy(XsCommandListProxy* proxy)
@@ -367,6 +401,97 @@ HRESULT WINAPI command_list_unimplemented(XsCommandListProxy* self, std::uintptr
     return E_NOTIMPL;
 }
 
+// Slot 25: forward SetPipelineState and keep the list's replacement state coherent. If the
+// replacement PSO is selected after the title already bound its own root signature, re-apply the
+// desktop replacement root signature; if the list leaves the replacement PSO, restore the title's
+// last requested root signature.
+void WINAPI command_list_set_pipeline_state(XsCommandListProxy* proxy, ID3D12PipelineState* pso)
+{
+    auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
+    real->SetPipelineState(pso);
+
+    ProxyDevice* device = proxy->device_proxy;
+    const bool replacement_pso =
+        device && device->replacement_pso && pso == device->replacement_pso;
+    if (replacement_pso && device->replacement_root_signature) {
+        real->SetComputeRootSignature(device->replacement_root_signature);
+        proxy->replacement_active = true;
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: command-list %p set replacement PSO %p -> root signature "
+                      "substituted\n",
+                      static_cast<void*>(proxy), static_cast<void*>(pso));
+        write_log(line);
+    } else if (proxy->replacement_active) {
+        real->SetComputeRootSignature(proxy->requested_root_signature);
+        proxy->replacement_active = false;
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: command-list %p left replacement PSO (pso=%p) -> restored "
+                      "root %p\n",
+                      static_cast<void*>(proxy), static_cast<void*>(pso),
+                      static_cast<void*>(proxy->requested_root_signature));
+        write_log(line);
+    }
+}
+
+// Slot 29: substitute the shim-owned root signature when the title binds the root signature that
+// was recorded for the replacement PSO. A previously bound replacement root signature is also
+// accepted. Everything else is forwarded unchanged and clears the replacement state.
+void WINAPI command_list_set_compute_root_signature(XsCommandListProxy* proxy,
+                                                    ID3D12RootSignature* root_signature)
+{
+    auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
+    ProxyDevice* device = proxy->device_proxy;
+    const bool is_our_root = device && root_signature == device->replacement_root_signature;
+    const bool is_game_root =
+        device && root_signature && root_signature == device->replacement_game_root_signature;
+    const bool null_for_replacement =
+        !root_signature && device && device->replacement_pso &&
+        device->replacement_game_root_signature == nullptr;
+
+    ID3D12RootSignature* effective = root_signature;
+    if (device && device->replacement_root_signature && (is_game_root || null_for_replacement)) {
+        effective = device->replacement_root_signature;
+        proxy->replacement_active = true;
+        proxy->requested_root_signature = root_signature;
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: command-list %p root %p -> replacement root %p (SRV t0/UAV u0)\n",
+                      static_cast<void*>(proxy), static_cast<void*>(root_signature),
+                      static_cast<void*>(effective));
+        write_log(line);
+    } else {
+        proxy->replacement_active = is_our_root;
+        if (!is_our_root) proxy->requested_root_signature = root_signature;
+    }
+    real->SetComputeRootSignature(effective);
+}
+
+// Slot 41: when the replacement binding is active, parameter 1 must reference the shim-owned dummy
+// UAV so the replacement shader writes into shim memory. The title's own address/index is ignored.
+// Otherwise the desktop call is forwarded unchanged.
+void WINAPI command_list_set_compute_root_uav(XsCommandListProxy* proxy, UINT root_parameter_index,
+                                              D3D12_GPU_VIRTUAL_ADDRESS buffer_location)
+{
+    auto* real = static_cast<ID3D12GraphicsCommandList*>(proxy->real_list);
+    ProxyDevice* device = proxy->device_proxy;
+    if (proxy->replacement_active && device && device->replacement_uav) {
+        const D3D12_GPU_VIRTUAL_ADDRESS dummy = device->replacement_uav->GetGPUVirtualAddress();
+        real->SetComputeRootUnorderedAccessView(1, dummy);
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: command-list %p UAV param %u addr 0x%llx -> dummy param 1 addr "
+                      "0x%llx\n",
+                      static_cast<void*>(proxy), static_cast<unsigned>(root_parameter_index),
+                      static_cast<unsigned long long>(buffer_location),
+                      static_cast<unsigned long long>(dummy));
+        write_log(line);
+    } else {
+        real->SetComputeRootUnorderedAccessView(root_parameter_index, buffer_location);
+    }
+}
+
 // Prefer the newest desktop list interface the SDK exposes, then fall back to the base one.
 HRESULT create_real_command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
                                  ID3D12CommandAllocator* allocator,
@@ -415,6 +540,12 @@ XsCommandListProxy* create_command_list_proxy(void* real_list, ProxyDevice* devi
         proxy->vtable_memory[slot] = thunk;
     }
     proxy->vtable_memory[7] = reinterpret_cast<void*>(&command_list_get_device);
+    proxy->vtable_memory[command_list_set_pipeline_state_slot] =
+        reinterpret_cast<void*>(&command_list_set_pipeline_state);
+    proxy->vtable_memory[command_list_set_compute_root_signature_slot] =
+        reinterpret_cast<void*>(&command_list_set_compute_root_signature);
+    proxy->vtable_memory[command_list_set_compute_root_uav_slot] =
+        reinterpret_cast<void*>(&command_list_set_compute_root_uav);
     for (std::size_t slot = command_list_stub_first; slot < command_list_vtable_slots; ++slot) {
         void* stub = cursor;
         cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&command_list_unimplemented));
@@ -623,12 +754,47 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
 constexpr std::size_t create_descriptor_heap_slot = 14;
 constexpr UINT desktop_shader_visible_limit = 1'000'000;
 
+// The title caches the console descriptor stride before it builds the view pools. On Scarlett that
+// cached value is 0xd8 while the desktop CBV/SRV/UAV increment is 0x20. The pool builder asks the
+// real device for the increment, but the reservation that is subtracted from the clamped logical
+// pool end (exe RVA 0x75df168) was precomputed with the cached value. With the desktop 1,000,000
+// descriptor clamp, that left only 0x384800 bytes, so the legacy view allocator initialization
+// (0x50000 descriptors, exe RVAs 0xa94393c/0xa943940) failed and the first view helper received a
+// stale stack value (0xb) as its CPU descriptor handle. Sync the cached stride with the real
+// device increment so the reservation and the pool use the same byte size. Measured game RVAs:
+// cached increment 0xa943914, reserved bytes 0x75df168.
+constexpr std::uintptr_t cached_descriptor_increment_rva = 0xA943914;
+
+void sync_cached_descriptor_increment(ID3D12Device* real)
+{
+    HMODULE game = GetModuleHandleW(nullptr);
+    if (!game || !real) return;
+    const UINT increment =
+        real->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto* slot = reinterpret_cast<std::uint32_t*>(
+        reinterpret_cast<unsigned char*>(game) + cached_descriptor_increment_rva);
+    const std::uint32_t previous = *slot;
+    if (previous == increment) return;
+    DWORD old_protection = 0;
+    if (VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &old_protection)) {
+        *slot = increment;
+        VirtualProtect(slot, sizeof(*slot), old_protection, &old_protection);
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: cached descriptor increment 0x%x -> 0x%x\n",
+                      static_cast<unsigned>(previous), static_cast<unsigned>(increment));
+        write_log(line);
+    }
+}
+
+
 HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
                                       REFIID iid, void** heap)
 {
     if (!proxy || !proxy->real) return E_UNEXPECTED;
     if (!desc || !heap) return E_POINTER;
     *heap = nullptr;
+    sync_cached_descriptor_increment(proxy->real);
     D3D12_DESCRIPTOR_HEAP_DESC copy = *desc;
     const bool clamp = (copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
                        copy.NumDescriptors > desktop_shader_visible_limit;
@@ -768,8 +934,11 @@ HRESULT WINAPI create_shader_resource_view_x(ProxyDevice*, const D3D12_CPU_DESCR
 
 // Xbox slot 62 is measured as compute-PSO creation (root-signature pointer, DXBC blob, IID on the
 // stack, out on the stack), not desktop ID3D12Device5::CreateStateObject. The title's blob is Xbox
-// DXIL, so create a source-built no-op SM5 compute PSO to keep the object graph valid. The BVH
-// dispatches become no-ops until the package DXIL is retargeted.
+// DXIL, so only the measured InitPartitionedHeaders container is replaced by a local source-built
+// shader. Every other PSO keeps the source-built no-op SM5 compute shader, and the replacement is
+// also skipped when its file, desktop root signature or dummy UAV is unavailable. The replacement
+// PSO is built against a shim-owned desktop root signature instead of desc->pRootSignature; the
+// command-list proxy substitutes that root signature and the dummy UAV when the PSO is dispatched.
 constexpr std::size_t create_compute_pipeline_state_x_slot = 62;
 
 struct noop_compute_shader {
@@ -805,6 +974,275 @@ const noop_compute_shader& noop_compute_shader_blob()
     return shader;
 }
 
+// ---------------------------------------------------------------------------------------------
+// InitPartitionedHeaders replacement registry.
+//
+// Detection uses the measured container length and an FNV-1a 64-bit hash over every byte of
+// desc->CS, not over a DXIL sub-chunk:
+//   container length = 0x1410
+//   FNV-1a 64        = 0x1e3c95fd4232f377
+// The hash was taken from the XboxBvhBuilder.dll DXBC container at RVA 0xc96b0. The replacement
+// bytes are never embedded in this file. They are read once from BVH_SHADER_DIR when that variable
+// is set, otherwise from the directory containing d3d12_xs.dll, and then cached for the process.
+// ---------------------------------------------------------------------------------------------
+constexpr SIZE_T init_partitioned_headers_length = 0x1410;
+constexpr std::uint64_t init_partitioned_headers_fnv1a64 = 0x1e3c95fd4232f377ull;
+constexpr wchar_t replacement_shader_file_name[] = L"init_partitioned_headers.signed.dxil";
+constexpr wchar_t replacement_shader_dir_variable[] = L"BVH_SHADER_DIR";
+constexpr DWORD max_replacement_shader_bytes = 64u * 1024u * 1024u;
+constexpr DWORD replacement_path_capacity = 32768;
+
+std::uint64_t fnv1a64(const void* data, SIZE_T size)
+{
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (SIZE_T index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= 0x100000001b3ull;
+    }
+    return hash;
+}
+
+bool is_init_partitioned_headers(const D3D12_SHADER_BYTECODE& shader)
+{
+    return shader.pShaderBytecode != nullptr &&
+           shader.BytecodeLength == init_partitioned_headers_length &&
+           fnv1a64(shader.pShaderBytecode, shader.BytecodeLength) ==
+               init_partitioned_headers_fnv1a64;
+}
+
+struct replacement_shader_cache {
+    bool attempted = false;
+    std::uint8_t* bytes = nullptr;
+    SIZE_T size = 0;
+};
+
+replacement_shader_cache replacement_shader;
+SRWLOCK replacement_shader_lock = SRWLOCK_INIT;
+
+bool get_shim_directory(wchar_t* directory, DWORD capacity)
+{
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&write_log), &module) ||
+        !module) {
+        return false;
+    }
+    const DWORD length = GetModuleFileNameW(module, directory, capacity);
+    if (length == 0 || length >= capacity) return false;
+    SIZE_T last_separator = static_cast<SIZE_T>(-1);
+    for (SIZE_T index = 0; index < length; ++index) {
+        if (directory[index] == L'\\' || directory[index] == L'/') last_separator = index;
+    }
+    if (last_separator == static_cast<SIZE_T>(-1)) return false;
+    directory[last_separator] = L'\0';
+    return true;
+}
+
+bool build_replacement_path(const wchar_t* directory, wchar_t* path, DWORD capacity)
+{
+    SIZE_T length = 0;
+    while (directory[length] != L'\0') ++length;
+    if (length == 0) return false;
+    const bool needs_separator = directory[length - 1] != L'\\' && directory[length - 1] != L'/';
+    return swprintf_s(path, capacity, needs_separator ? L"%s\\%s" : L"%s%s", directory,
+                      replacement_shader_file_name) > 0;
+}
+
+bool read_replacement_shader(const wchar_t* path, replacement_shader_cache& cache)
+{
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: BVH replacement shader unavailable (open error %lu) -> noop\n",
+                      static_cast<unsigned long>(GetLastError()));
+        write_log(line);
+        return false;
+    }
+    LARGE_INTEGER file_size{};
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0 ||
+        file_size.QuadPart > static_cast<LONGLONG>(max_replacement_shader_bytes)) {
+        CloseHandle(file);
+        write_log("d3d12_xs: BVH replacement shader size rejected -> noop\n");
+        return false;
+    }
+    const SIZE_T size = static_cast<SIZE_T>(file_size.QuadPart);
+    auto* bytes = new (std::nothrow) std::uint8_t[size];
+    if (!bytes) {
+        CloseHandle(file);
+        write_log("d3d12_xs: BVH replacement shader allocation failed -> noop\n");
+        return false;
+    }
+    SIZE_T offset = 0;
+    while (offset < size) {
+        const SIZE_T remaining = size - offset;
+        const DWORD request = static_cast<DWORD>(remaining > 0x7fffffffu ? 0x7fffffffu : remaining);
+        DWORD read = 0;
+        if (!ReadFile(file, bytes + offset, request, &read, nullptr) || read == 0) {
+            delete[] bytes;
+            CloseHandle(file);
+            write_log("d3d12_xs: BVH replacement shader read failed -> noop\n");
+            return false;
+        }
+        offset += read;
+    }
+    CloseHandle(file);
+    cache.bytes = bytes;
+    cache.size = size;
+    char line[160];
+    std::snprintf(line, sizeof(line), "d3d12_xs: BVH replacement shader loaded bytes=%llu\n",
+                  static_cast<unsigned long long>(size));
+    write_log(line);
+    return true;
+}
+
+const replacement_shader_cache& replacement_shader_blob()
+{
+    AcquireSRWLockExclusive(&replacement_shader_lock);
+    if (!replacement_shader.attempted) {
+        replacement_shader.attempted = true;
+        wchar_t directory[replacement_path_capacity];
+        const DWORD env_length = GetEnvironmentVariableW(
+            replacement_shader_dir_variable, directory, replacement_path_capacity);
+        bool have_directory = env_length > 0 && env_length < replacement_path_capacity;
+        if (!have_directory) {
+            if (env_length == 0) {
+                have_directory = get_shim_directory(directory, replacement_path_capacity);
+            } else {
+                write_log("d3d12_xs: BVH_SHADER_DIR is too long -> noop\n");
+            }
+        }
+        wchar_t path[replacement_path_capacity];
+        if (have_directory &&
+            build_replacement_path(directory, path, replacement_path_capacity)) {
+            read_replacement_shader(path, replacement_shader);
+        } else if (have_directory) {
+            write_log("d3d12_xs: BVH replacement shader path is too long -> noop\n");
+        } else if (env_length == 0) {
+            write_log("d3d12_xs: d3d12_xs.dll directory unavailable -> noop\n");
+        }
+    }
+    ReleaseSRWLockExclusive(&replacement_shader_lock);
+    return replacement_shader;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Desktop binding resources for the replacement PSO.
+//
+// The title's root signature describes the console shader's layout, so the replacement PSO gets a
+// shim-owned desktop root signature instead: root SRV t0 at parameter 0 and root UAV u0 at
+// parameter 1. A single 16 MiB default-heap buffer is the dummy UAV that the replacement shader
+// writes into. Both objects are created once per device proxy. If either creation fails, the
+// compute-PSO path keeps the source-built no-op shader and the command-list handlers stay inert.
+// ---------------------------------------------------------------------------------------------
+constexpr UINT64 replacement_uav_bytes = 16ull * 1024ull * 1024ull;
+
+bool ensure_replacement_resources(ProxyDevice* proxy)
+{
+    if (!proxy || !proxy->real) return false;
+
+    AcquireSRWLockExclusive(&proxy->replacement_resources_lock);
+    if (!proxy->replacement_resources_attempted) {
+        proxy->replacement_resources_attempted = true;
+
+        D3D12_ROOT_PARAMETER parameters[2]{};
+        parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        parameters[0].Descriptor.ShaderRegister = 0;
+        parameters[0].Descriptor.RegisterSpace = 0;
+        parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        parameters[1].Descriptor.ShaderRegister = 0;
+        parameters[1].Descriptor.RegisterSpace = 0;
+        parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC root_desc{};
+        root_desc.NumParameters = 2;
+        root_desc.pParameters = parameters;
+        root_desc.NumStaticSamplers = 0;
+        root_desc.pStaticSamplers = nullptr;
+        root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        ID3DBlob* signature = nullptr;
+        ID3DBlob* errors = nullptr;
+        HRESULT result = D3D12SerializeRootSignature(
+            &root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors);
+        if (SUCCEEDED(result) && signature) {
+            result = proxy->real->CreateRootSignature(
+                0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                __uuidof(ID3D12RootSignature),
+                reinterpret_cast<void**>(&proxy->replacement_root_signature));
+        }
+        if (errors) errors->Release();
+        if (signature) signature->Release();
+        if (FAILED(result) || !proxy->replacement_root_signature) {
+            if (proxy->replacement_root_signature) {
+                proxy->replacement_root_signature->Release();
+                proxy->replacement_root_signature = nullptr;
+            }
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: BVH replacement root signature unavailable (0x%08lx) -> "
+                          "noop\n",
+                          static_cast<unsigned long>(result));
+            write_log(line);
+        } else {
+            write_log("d3d12_xs: BVH replacement root signature created "
+                      "(root SRV t0 @0, root UAV u0 @1)\n");
+        }
+
+        if (proxy->replacement_root_signature) {
+            D3D12_HEAP_PROPERTIES heap_properties{};
+            heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+            heap_properties.CreationNodeMask = 1;
+            heap_properties.VisibleNodeMask = 1;
+
+            D3D12_RESOURCE_DESC uav_desc{};
+            uav_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uav_desc.Alignment = 0;
+            uav_desc.Width = replacement_uav_bytes;
+            uav_desc.Height = 1;
+            uav_desc.DepthOrArraySize = 1;
+            uav_desc.MipLevels = 1;
+            uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+            uav_desc.SampleDesc.Count = 1;
+            uav_desc.SampleDesc.Quality = 0;
+            uav_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            uav_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+            result = proxy->real->CreateCommittedResource(
+                &heap_properties, D3D12_HEAP_FLAG_NONE, &uav_desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource),
+                reinterpret_cast<void**>(&proxy->replacement_uav));
+            if (FAILED(result) || !proxy->replacement_uav) {
+                if (proxy->replacement_uav) {
+                    proxy->replacement_uav->Release();
+                    proxy->replacement_uav = nullptr;
+                }
+                char line[192];
+                std::snprintf(line, sizeof(line),
+                              "d3d12_xs: BVH replacement UAV unavailable (0x%08lx) -> noop\n",
+                              static_cast<unsigned long>(result));
+                write_log(line);
+            } else {
+                char line[192];
+                std::snprintf(line, sizeof(line),
+                              "d3d12_xs: BVH replacement UAV created bytes=%llu "
+                              "state=UNORDERED_ACCESS addr=0x%llx\n",
+                              static_cast<unsigned long long>(replacement_uav_bytes),
+                              static_cast<unsigned long long>(
+                                  proxy->replacement_uav->GetGPUVirtualAddress()));
+                write_log(line);
+            }
+        }
+    }
+    const bool ready = proxy->replacement_root_signature && proxy->replacement_uav;
+    ReleaseSRWLockExclusive(&proxy->replacement_resources_lock);
+    return ready;
+}
+
 HRESULT WINAPI create_compute_pipeline_state_x(
     ProxyDevice* proxy, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, std::uintptr_t,
     std::uintptr_t, const IID* iid, void** pipeline_state)
@@ -812,21 +1250,74 @@ HRESULT WINAPI create_compute_pipeline_state_x(
     if (!proxy || !proxy->real) return E_UNEXPECTED;
     if (!desc || !pipeline_state) return E_POINTER;
     *pipeline_state = nullptr;
+
     const auto& shader = noop_compute_shader_blob();
-    if (FAILED(shader.result) || !shader.blob) return shader.result;
+    const bool noop_ready = SUCCEEDED(shader.result) && shader.blob;
+
+    const bool replacement_target = is_init_partitioned_headers(desc->CS);
+    const replacement_shader_cache* replacement = nullptr;
+    if (replacement_target) {
+        const replacement_shader_cache& cached = replacement_shader_blob();
+        if (cached.bytes && cached.size && ensure_replacement_resources(proxy)) {
+            replacement = &cached;
+        }
+    }
+    if (!replacement && !noop_ready) return shader.result;
+
     D3D12_COMPUTE_PIPELINE_STATE_DESC safe = *desc;
     if (!safe.NodeMask) safe.NodeMask = 1;
-    safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
     safe.CachedPSO = {};
     safe.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
     const IID& requested = iid ? *iid : __uuidof(ID3D12PipelineState);
+
+    const char* source = "noop";
+    bool uses_replacement = replacement != nullptr;
+    if (replacement) {
+        safe.CS = {replacement->bytes, replacement->size};
+        safe.pRootSignature = proxy->replacement_root_signature;
+        source = "replacement";
+    } else {
+        if (replacement_target) source = "noop (replacement unavailable)";
+        safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
+    }
+
     HRESULT result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
-    if (FAILED(result) && safe.pRootSignature) {
+    if (FAILED(result) && safe.pRootSignature && !uses_replacement) {
         safe.pRootSignature = nullptr;
         result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
     }
+    if (FAILED(result) && uses_replacement) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: replacement compute PSO failed 0x%08lx -> noop\n",
+                      static_cast<unsigned long>(result));
+        write_log(line);
+        if (!noop_ready) return result;
+        uses_replacement = false;
+        safe.pRootSignature = desc->pRootSignature;
+        safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
+        source = "noop (replacement create failed)";
+        *pipeline_state = nullptr;
+        result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
+        if (FAILED(result) && safe.pRootSignature) {
+            safe.pRootSignature = nullptr;
+            result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
+        }
+    }
+
+    if (SUCCEEDED(result) && uses_replacement && *pipeline_state) {
+        proxy->replacement_game_root_signature = desc->pRootSignature;
+        proxy->replacement_pso = static_cast<ID3D12PipelineState*>(*pipeline_state);
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: replacement PSO registered pso=%p game_root=%p shim_root=%p\n",
+                      *pipeline_state, static_cast<void*>(desc->pRootSignature),
+                      static_cast<void*>(proxy->replacement_root_signature));
+        write_log(line);
+    }
+
     char line[192];
-    std::snprintf(line, sizeof(line), "d3d12_xs: noop compute PSO -> 0x%08lx\n",
+    std::snprintf(line, sizeof(line), "d3d12_xs: compute PSO src=%s -> 0x%08lx\n", source,
                   static_cast<unsigned long>(result));
     write_log(line);
     return result;
@@ -836,6 +1327,7 @@ ProxyDevice* create_proxy(ID3D12Device* real)
 {
     auto* proxy = new (std::nothrow) ProxyDevice{};
     if (!proxy) return nullptr;
+    InitializeSRWLock(&proxy->replacement_resources_lock);
 
     proxy->vtable_memory = new (std::nothrow) void*[proxy_vtable_slots]{};
     if (!proxy->vtable_memory) {
@@ -991,6 +1483,8 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
                   static_cast<unsigned>(options5.RaytracingTier),
                   static_cast<unsigned long>(feature_hr));
     write_log(line);
+    sync_cached_descriptor_increment(real_device);
+
 
     ProxyDevice* proxy = create_proxy(real_device);
     if (!proxy) {
