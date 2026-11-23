@@ -82,6 +82,11 @@ struct ProxyDevice {
     ID3D12Resource* replacement_uav;                 // 16 MiB dummy, state UNORDERED_ACCESS.
     ID3D12PipelineState* replacement_pso;            // borrowed: the created replacement PSO.
     ID3D12RootSignature* replacement_game_root_signature; // borrowed: desc->pRootSignature.
+    // Desktop backing for the title's console descriptor pool: console addresses in
+    // [descriptor_legacy_base, ...) map to descriptor_real_cpu + (address - descriptor_legacy_base).
+    std::uintptr_t descriptor_legacy_base;
+    std::uintptr_t descriptor_real_cpu;
+    std::uintptr_t descriptor_real_gpu;
 };
 
 constexpr std::size_t forward_thunk_bytes = 23;
@@ -934,6 +939,9 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
     if ((copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
         const std::uintptr_t legacy = legacy_pool_base();
         const UINT increment = proxy->real->GetDescriptorHandleIncrementSize(copy.Type);
+        proxy->descriptor_legacy_base = legacy;
+        proxy->descriptor_real_cpu = real_heap->GetCPUDescriptorHandleForHeapStart().ptr;
+        proxy->descriptor_real_gpu = real_heap->GetGPUDescriptorHandleForHeapStart().ptr;
         if (legacy && increment) {
             const SIZE_T bytes = static_cast<SIZE_T>(copy.NumDescriptors) * increment;
             // The legacy base is one segment of the title's XMem pool, not the whole descriptor
@@ -1009,6 +1017,10 @@ HRESULT WINAPI create_command_queue_x(ProxyDevice* proxy, const void* desc, REFI
 // instead of answering S_OK without producing an object.
 constexpr std::size_t create_pipeline_state_streams_slot = 86;
 
+// Defined after the no-op shader blob; used as a fallback when a console pipeline state cannot be
+// created for desktop.
+HRESULT create_noop_pipeline_state(ID3D12Device* device, void** state);
+
 HRESULT WINAPI create_pipeline_state_streams(ProxyDevice* proxy,
                                              const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                              REFIID iid, void** state)
@@ -1028,6 +1040,15 @@ HRESULT WINAPI create_pipeline_state_streams(ProxyDevice* proxy,
     std::snprintf(line, sizeof(line), "d3d12_xs: slot86 CreatePipelineState streams -> 0x%08lx\n",
                   static_cast<unsigned long>(result));
     write_log(line);
+    if (SUCCEEDED(result) && *state) return result;
+
+    // The console stream descriptor carries Xbox-only streams, so desktop creation can fail. The
+    // title ignores the failure and binds the state, so hand back a valid pipeline instead of null.
+    const HRESULT fallback_hr = create_noop_pipeline_state(proxy->real, state);
+    std::snprintf(line, sizeof(line), "d3d12_xs: slot86 fallback noop PSO -> 0x%08lx\n",
+                  static_cast<unsigned long>(fallback_hr));
+    write_log(line);
+    if (SUCCEEDED(fallback_hr) && *state) return S_OK;
     return result;
 }
 
@@ -1071,6 +1092,13 @@ HRESULT WINAPI create_sampler_x(ProxyDevice* proxy, const void* desc, std::uintp
         }
     }
     if (!destination) return E_INVALIDARG;
+    // The title's destination is a console address in its own pool. Desktop needs the descriptor in
+    // a real heap, so map it to the matching offset of the shader-visible heap backing that pool.
+    std::uintptr_t target = destination;
+    if (proxy->descriptor_legacy_base && proxy->descriptor_real_cpu &&
+        destination >= proxy->descriptor_legacy_base) {
+        target = proxy->descriptor_real_cpu + (destination - proxy->descriptor_legacy_base);
+    }
     D3D12_SAMPLER_DESC pc{};
     pc.Filter = D3D12_FILTER_ANISOTROPIC;
     pc.MaxAnisotropy = 16;
@@ -1080,7 +1108,18 @@ HRESULT WINAPI create_sampler_x(ProxyDevice* proxy, const void* desc, std::uintp
     pc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     pc.MinLOD = 0.0f;
     pc.MaxLOD = D3D12_FLOAT32_MAX;
-    proxy->real->CreateSampler(&pc, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+    proxy->real->CreateSampler(&pc, D3D12_CPU_DESCRIPTOR_HANDLE{target});
+    static volatile LONG mapped_logged = 0;
+    if (InterlockedCompareExchange(&mapped_logged, 1, 0) == 0) {
+        char map_line[224];
+        std::snprintf(map_line, sizeof(map_line),
+                      "d3d12_xs: slot61 dest=0x%llx legacy=0x%llx real_cpu=0x%llx target=0x%llx\n",
+                      static_cast<unsigned long long>(destination),
+                      static_cast<unsigned long long>(proxy->descriptor_legacy_base),
+                      static_cast<unsigned long long>(proxy->descriptor_real_cpu),
+                      static_cast<unsigned long long>(target));
+        write_log(map_line);
+    }
     return S_OK;
 }
 
@@ -1565,6 +1604,17 @@ bool ensure_replacement_resources(ProxyDevice* proxy)
     const bool ready = proxy->replacement_root_signature && proxy->replacement_uav;
     ReleaseSRWLockExclusive(&proxy->replacement_resources_lock);
     return ready;
+}
+
+HRESULT create_noop_pipeline_state(ID3D12Device* device, void** state)
+{
+    if (!device || !state) return E_POINTER;
+    const auto& shader = noop_compute_shader_blob();
+    if (FAILED(shader.result) || !shader.blob) return E_FAIL;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.NodeMask = 1;
+    desc.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
+    return device->CreateComputePipelineState(&desc, __uuidof(ID3D12PipelineState), state);
 }
 
 HRESULT WINAPI create_compute_pipeline_state_x(
