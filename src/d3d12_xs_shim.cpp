@@ -712,6 +712,7 @@ struct DescriptorHeapProxy {
     volatile LONG references;   // +8
     ID3D12DescriptorHeap* real; // +16
     void** vtable_memory;       // +24
+    bool use_legacy_base;       // +32  clamped shader-visible CBV/SRV/UAV pool
 };
 
 void destroy_descriptor_heap_proxy(DescriptorHeapProxy* proxy)
@@ -746,14 +747,42 @@ HRESULT WINAPI descriptor_heap_query_interface(DescriptorHeapProxy* proxy, REFII
     return E_NOINTERFACE;
 }
 
+// The title's descriptor bump allocator derives handles from the heap start and later compares that
+// start against the legacy XMem pool base it recorded (game RVA 0x1cf336c). Reporting the desktop
+// heap address makes that comparison fail and leaves the title's handle arithmetic pointing at
+// addresses it never mapped. For the clamped shader-visible pool the proxy therefore reports the
+// legacy base (game global 0x75df188) as the CPU start, and offsets the GPU handle by the same
+// delta so CPU/GPU handle pairs stay consistent.
+constexpr std::uintptr_t legacy_descriptor_pool_base_rva = 0x75DF188;
+
+std::uintptr_t legacy_pool_base()
+{
+    HMODULE game = GetModuleHandleW(nullptr);
+    if (!game) return 0;
+    const auto* slot = reinterpret_cast<const std::uintptr_t*>(
+        reinterpret_cast<const unsigned char*>(game) + legacy_descriptor_pool_base_rva);
+    return *slot;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_cpu(DescriptorHeapProxy* proxy)
 {
-    return proxy->real->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE real = proxy->real->GetCPUDescriptorHandleForHeapStart();
+    if (proxy->use_legacy_base) {
+        const std::uintptr_t legacy = legacy_pool_base();
+        if (legacy) return D3D12_CPU_DESCRIPTOR_HANDLE{legacy};
+    }
+    return real;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_gpu(DescriptorHeapProxy* proxy)
 {
-    return proxy->real->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_GPU_DESCRIPTOR_HANDLE real = proxy->real->GetGPUDescriptorHandleForHeapStart();
+    if (proxy->use_legacy_base) {
+        const std::uintptr_t legacy = legacy_pool_base();
+        const std::uintptr_t cpu = proxy->real->GetCPUDescriptorHandleForHeapStart().ptr;
+        if (legacy && cpu) return D3D12_GPU_DESCRIPTOR_HANDLE{real.ptr + (legacy - cpu)};
+    }
+    return real;
 }
 
 HRESULT WINAPI descriptor_heap_unimplemented(DescriptorHeapProxy*)
@@ -761,7 +790,7 @@ HRESULT WINAPI descriptor_heap_unimplemented(DescriptorHeapProxy*)
     return E_NOTIMPL;
 }
 
-DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
+DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real, bool use_legacy_base)
 {
     auto* proxy = new (std::nothrow) DescriptorHeapProxy{};
     if (!proxy) return nullptr;
@@ -779,6 +808,7 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real)
     for (std::size_t slot = 3; slot < 16; ++slot) {
         proxy->vtable_memory[slot] = reinterpret_cast<void*>(&descriptor_heap_unimplemented);
     }
+    proxy->use_legacy_base = use_legacy_base;
     proxy->vtable_memory[9] = reinterpret_cast<void*>(&descriptor_heap_get_cpu);
     proxy->vtable_memory[10] = reinterpret_cast<void*>(&descriptor_heap_get_gpu);
     return proxy;
@@ -876,8 +906,9 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
     *heap = nullptr;
     sync_cached_descriptor_increment(proxy->real);
     D3D12_DESCRIPTOR_HEAP_DESC copy = *desc;
-    const bool clamp = (copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
-                       copy.NumDescriptors > desktop_shader_visible_limit;
+    const bool shader_visible =
+        (copy.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+    const bool clamp = shader_visible && copy.NumDescriptors > desktop_shader_visible_limit;
     if (clamp) copy.NumDescriptors = desktop_shader_visible_limit;
     ID3D12DescriptorHeap* real_heap = nullptr;
     const HRESULT result = proxy->real->CreateDescriptorHeap(
@@ -899,7 +930,7 @@ HRESULT WINAPI create_descriptor_heap(ProxyDevice* proxy, const D3D12_DESCRIPTOR
                       static_cast<unsigned>(copy.NumDescriptors));
         write_log(line);
     }
-    DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap);
+    DescriptorHeapProxy* wrapper = create_descriptor_heap_proxy(real_heap, shader_visible);
     if (!wrapper) {
         real_heap->Release();
         return E_OUTOFMEMORY;
