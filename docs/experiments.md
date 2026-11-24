@@ -5408,3 +5408,13 @@ first lookup for this name.
 Implementing the queue reads remains necessary, but no queue method is called
 yet; the current stop is device/class instantiation and the unresolved
 `platform:` mount. No window, frame loop or present has been reached.
+
+The device namespace resolver at `0x968480` parses the prefix before `:`, hashes
+it with the byte-wise hash at `0x4fc2280`, and recognises three hashes:
+`0xb37535d9` (`memory`), `0x46b0fb26` and `0x5dccb711`. The fallbacks compare the
+whole string against `tcpip:`, `globalroot`, `\\??\\T:`, `\\?\T:`, `T:`, `R:`
+and their slash variants. A name without a recognised prefix, such as `im`, has
+no device and the open at `0x247b530` fails. Mapping the package directory to
+`T:` and `R:` with `subst` does not change the stop (runs 167/168), so the missing
+piece is the game's own registration of the console mount, not a desktop drive
+letter.
