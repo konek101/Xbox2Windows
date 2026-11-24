@@ -5451,3 +5451,11 @@ With that harness-only workaround the run advances past the resource loop and re
 device registration at `0x3750bc0`. There the name-based factory `0x1adcc20` still returns null for
 the name `im`, and `0x3750bd4` faults reading `[rsi+0xcf8]`. This is the same unresolved console
 device/mount registration; the game still reaches no window, frame loop or present.
+
+Tracing the name-based device factory (`0x1adcc20` → `0x247b530` → `0x5cabbe0`) shows what the
+name `im` is used for. The file branch at `0x5cabc16` builds the path
+`platform:/shaders/v2/sga_xbsx_final/im.fxc` (measured from the buffer at `0x5cabc30`) and opens it
+through `0x1972c90`; that returns 0 because no `platform:` device is registered. The type-hash
+factory workaround therefore only moves startup to the same console VFS gap: without a platform
+mount (or the engine's RPF packfile device) the file device cannot be created and the run faults at
+`0x3750bd4`. No window, frame loop or present is reached.
