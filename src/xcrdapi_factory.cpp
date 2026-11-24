@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
+#include <cstring>
 #include <utility>
 
 namespace {
@@ -62,6 +63,8 @@ struct factory_object {
 
 struct status_array_object;
 status_array_object& status_array();
+struct queue_object;
+queue_object& queue();
 
 HRESULT STDMETHODCALLTYPE factory_query_interface(factory_object* self, const GUID* interface_id,
                                                   void** out)
@@ -87,8 +90,24 @@ HRESULT STDMETHODCALLTYPE factory_create_queue(factory_object*, const void* desc
 {
     log_line(L"factory CreateQueue description=%p", description);
     log_guid(L"factory CreateQueue iid", interface_id);
-    if (out) *out = nullptr;
-    return not_implemented;
+    // Console queue descriptor (XCL reference): source type u32 at 0, capacity u16 at 8,
+    // priority i8 at 0xa, name pointer at 0x10. The newer create path passes an extra qword at 0x18.
+    if (description != nullptr) {
+        const auto* bytes = static_cast<const unsigned char*>(description);
+        std::uint32_t source_type = 0;
+        std::uint16_t capacity = 0;
+        std::int8_t priority = 0;
+        const void* name = nullptr;
+        std::memcpy(&source_type, bytes, sizeof(source_type));
+        std::memcpy(&capacity, bytes + 8, sizeof(capacity));
+        std::memcpy(&priority, bytes + 0xa, sizeof(priority));
+        std::memcpy(&name, bytes + 0x10, sizeof(name));
+        log_line(L"factory queue source=%lu capacity=%u priority=%d name=%p", source_type, capacity,
+                 static_cast<int>(priority), name);
+    }
+    if (out == nullptr) return E_POINTER;
+    *out = &queue();
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE factory_create_status_array(factory_object*, std::uint32_t capacity,
@@ -211,6 +230,131 @@ status_array_object& status_array()
     return object;
 }
 
+// DirectStorage queue stub. The measured newer create path (factory slot 10) passes a queue
+// descriptor and an out pointer. Requests are measured as 0x48-byte records (XCL reference), but the
+// synchronous reader is not implemented yet: every method answers success so the rest of startup can
+// be measured, and the request log shows what the title submits.
+struct queue_object {
+    void** vtable;
+};
+
+HRESULT STDMETHODCALLTYPE queue_query_interface(queue_object* self, const GUID* interface_id,
+                                                void** out)
+{
+    log_guid(L"queue QueryInterface iid", interface_id);
+    if (out == nullptr) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+
+ULONG STDMETHODCALLTYPE queue_add_ref(queue_object*)
+{
+    return 2;
+}
+
+ULONG STDMETHODCALLTYPE queue_release(queue_object*)
+{
+    return 0;
+}
+
+void STDMETHODCALLTYPE queue_enqueue_request(queue_object*, const void* request)
+{
+    static LONG count = 0;
+    if (InterlockedIncrement(&count) > 16) return;
+    if (request != nullptr) {
+        const auto* bytes = static_cast<const unsigned char*>(request);
+        std::uint64_t destination = 0;
+        std::uint64_t size = 0;
+        std::uint64_t source = 0;
+        std::uint64_t file_offset = 0;
+        std::memcpy(&destination, bytes + 8, sizeof(destination));
+        std::memcpy(&size, bytes + 0x18, sizeof(size));
+        std::memcpy(&source, bytes + 0x20, sizeof(source));
+        std::memcpy(&file_offset, bytes + 0x28, sizeof(file_offset));
+        log_line(L"queue EnqueueRequest options=%016llx dst=%016llx size=%016llx src=%016llx "
+                 L"offset=%016llx",
+                 *reinterpret_cast<const unsigned long long*>(bytes), destination, size, source,
+                 file_offset);
+    }
+}
+
+void STDMETHODCALLTYPE queue_submit(queue_object*)
+{
+    log_line(L"queue Submit");
+}
+
+void STDMETHODCALLTYPE queue_cancel(queue_object*, std::uint64_t mask, std::uint64_t value)
+{
+    log_line(L"queue CancelRequestsWithTag mask=%016llx value=%016llx", mask, value);
+}
+
+void STDMETHODCALLTYPE queue_close(queue_object*)
+{
+    log_line(L"queue Close");
+}
+
+HANDLE STDMETHODCALLTYPE queue_get_error_event(queue_object*)
+{
+    log_line(L"queue GetErrorEvent");
+    return nullptr;
+}
+
+void STDMETHODCALLTYPE queue_retrieve_error_record(queue_object*, void* record)
+{
+    log_line(L"queue RetrieveErrorRecord record=%p", record);
+    if (record != nullptr) ZeroMemory(record, 0x290);
+}
+
+HRESULT STDMETHODCALLTYPE queue_query_info(queue_object*, std::uint32_t info_id, void* info,
+                                           std::uint32_t info_size)
+{
+    log_line(L"queue Query id=%lu info=%p size=%lu", info_id, info, info_size);
+    if (info != nullptr && info_size != 0) ZeroMemory(info, info_size);
+    return S_OK;
+}
+
+template <std::size_t Slot>
+HRESULT STDMETHODCALLTYPE queue_unknown_slot(void*, std::uint64_t a, std::uint64_t b,
+                                             std::uint64_t c)
+{
+    log_line(L"queue unknown slot=%zu a=%016llx b=%016llx c=%016llx", Slot,
+             static_cast<unsigned long long>(a), static_cast<unsigned long long>(b),
+             static_cast<unsigned long long>(c));
+    return S_OK;
+}
+
+template <std::size_t... I>
+void fill_queue_slots(std::array<void*, 16>& table, std::index_sequence<I...>)
+{
+    ((table[10 + I] = reinterpret_cast<void*>(&queue_unknown_slot<10 + I>)), ...);
+}
+
+void** queue_vtable()
+{
+    static std::array<void*, 16> table = [] {
+        std::array<void*, 16> result{};
+        result[0] = reinterpret_cast<void*>(&queue_query_interface);
+        result[1] = reinterpret_cast<void*>(&queue_add_ref);
+        result[2] = reinterpret_cast<void*>(&queue_release);
+        result[3] = reinterpret_cast<void*>(&queue_enqueue_request);
+        result[4] = reinterpret_cast<void*>(&queue_submit);
+        result[5] = reinterpret_cast<void*>(&queue_cancel);
+        result[6] = reinterpret_cast<void*>(&queue_close);
+        result[7] = reinterpret_cast<void*>(&queue_get_error_event);
+        result[8] = reinterpret_cast<void*>(&queue_retrieve_error_record);
+        result[9] = reinterpret_cast<void*>(&queue_query_info);
+        fill_queue_slots(result, std::make_index_sequence<6>{});
+        return result;
+    }();
+    return table.data();
+}
+
+queue_object& queue()
+{
+    static queue_object object{queue_vtable()};
+    return object;
+}
+
 template <std::size_t... I>
 void fill_unknown_slots(std::array<void*, 3 + slot_count>& table, std::index_sequence<I...>)
 {
@@ -231,6 +375,9 @@ void** factory_vtable()
         result[7] = reinterpret_cast<void*>(&factory_set_debug_flags);
         result[8] = reinterpret_cast<void*>(&factory_set_staging_buffer_size);
         fill_unknown_slots(result, std::make_index_sequence<slot_count - 9>{});
+        // Measured newer create path: the title calls slot 10 (0x50) with (desc, iid, out) and a
+        // queue descriptor whose fields match the XCL reference at 0/8/0xa/0x10.
+        result[10] = reinterpret_cast<void*>(&factory_create_queue);
         return result;
     }();
     return table.data();
