@@ -5439,3 +5439,15 @@ The next stop is a 64-bit type-hash factory at `0x5204e60`. At game RVA `0x5bfeb
 with hash `0xad8df9f665b4d922` and returns null, so the global at `0x75eac68` stays null and the
 resource path asserts at `0xcc2936` (skipping it faults at `0xcc2861`). The following call uses
 `0x0521e36b36ffacf9`. The class registration behind that factory is the open question.
+
+The type-hash factory (`0x5204e60`/`0x34beb0`) constructs its object through the resource base
+`0x193de10`. Two branches rejected the console descriptors: slot 127 succeeded, but the engine
+virtual-address allocator `0x2474690` got a zero size from the descriptor translation at
+`0xabfad0`, and a zero size returns null. Instrumentation at `0x193e230` and `0x193e1e5` shows the
+zero and, when the size is forced to `0x10000`, the allocator returns a VA and the factory returns a
+non-null object (`factory: first stored: rax=0x233011c7600`).
+
+With that harness-only workaround the run advances past the resource loop and returns to the file
+device registration at `0x3750bc0`. There the name-based factory `0x1adcc20` still returns null for
+the name `im`, and `0x3750bd4` faults reading `[rsi+0xcf8]`. This is the same unresolved console
+device/mount registration; the game still reaches no window, frame loop or present.
