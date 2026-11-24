@@ -5418,3 +5418,24 @@ no device and the open at `0x247b530` fails. Mapping the package directory to
 `T:` and `R:` with `subst` does not change the stop (runs 167/168), so the missing
 piece is the game's own registration of the console mount, not a desktop drive
 letter.
+
+### Console device methods that return structs through RCX
+
+Two more device methods return a struct through a caller buffer in RCX, with the proxy in RDX.
+Desktop returns the 16-byte `D3D12_RESOURCE_ALLOCATION_INFO` in RAX:RDX instead, so the generic
+forwarding thunk left the buffer untouched and the caller asserted on stale stack.
+
+- Slot 25 (`0xc8`, measured at game RVA `0x344182`): `(buffer, proxy, visibleMask, numDescs,
+  pDescs)`. The shim calls `GetResourceAllocationInfo` with the console descriptor, masking
+  `D3D12_RESOURCE_FLAGS` to the desktop bits and clearing a non-64 KiB `Alignment` (console values
+  include `0x300005`/`0x300000` flags and a 4096 alignment, both of which make desktop return
+  `UINT64_MAX`). The measured results are now `size=8847360 align=65536` for 1920x1080 R8G8B8A8 and
+  `size=65536` for 256x128, and the `0x344196` debug-assert loop drops to six occurrences.
+- Slot 108 (`0x360`, measured at game RVA `0xabfe07`): the caller copies a 16-byte struct from the
+  buffer and requires the high dword of the first field to be zero. The method is not identified
+  yet; the shim zeroes 32 bytes and returns the buffer, which passes that check.
+
+The next stop is a 64-bit type-hash factory at `0x5204e60`. At game RVA `0x5bfeb8b` it is called
+with hash `0xad8df9f665b4d922` and returns null, so the global at `0x75eac68` stays null and the
+resource path asserts at `0xcc2936` (skipping it faults at `0xcc2861`). The following call uses
+`0x0521e36b36ffacf9`. The class registration behind that factory is the open question.

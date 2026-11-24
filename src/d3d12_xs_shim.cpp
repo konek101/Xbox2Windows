@@ -1259,7 +1259,95 @@ void WINAPI copy_descriptors_simple(ProxyDevice* proxy, UINT count,
     }
 }
 
+// Console slot 25 (offset 0xC8) returns D3D12_RESOURCE_ALLOCATION_INFO into a caller buffer:
+// RCX = buffer, RDX = proxy, R8D = visibleMask, R9D = numResourceDescs, stack = pResourceDescs.
+// Desktop's 16-byte struct return uses RAX:RDX, so the generic swap thunk leaves the buffer untouched
+// and the caller reads stale stack (measured: [buffer+4] != 0, debug assert loop at game 0x344196).
+void* WINAPI get_resource_allocation_info_x(void* return_buffer, ProxyDevice* proxy,
+                                            UINT visible_mask, UINT num_resource_descs,
+                                            const D3D12_RESOURCE_DESC* resource_descs)
+{
+    if (!return_buffer) return nullptr;
+    if (!proxy || !proxy->real) {
+        std::memset(return_buffer, 0, sizeof(D3D12_RESOURCE_ALLOCATION_INFO));
+        return return_buffer;
+    }
+    D3D12_RESOURCE_DESC sanitized[8]{};
+    const UINT count = num_resource_descs > 8 ? 8 : num_resource_descs;
+    const D3D12_RESOURCE_DESC* descs = resource_descs;
+    if (resource_descs && count) {
+        // Console descriptors carry flag bits and non-64 KiB alignment that desktop rejects; either
+        // makes GetResourceAllocationInfo return UINT64_MAX.
+        constexpr D3D12_RESOURCE_FLAGS allowed_flags =
+            static_cast<D3D12_RESOURCE_FLAGS>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                              D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+        for (UINT index = 0; index < count; ++index) {
+            sanitized[index] = resource_descs[index];
+            sanitized[index].Flags =
+                static_cast<D3D12_RESOURCE_FLAGS>(sanitized[index].Flags & allowed_flags);
+            if (sanitized[index].Alignment != 0 &&
+                sanitized[index].Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+                sanitized[index].Alignment = 0;
+            }
+        }
+        descs = sanitized;
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO info =
+        proxy->real->GetResourceAllocationInfo(visible_mask, num_resource_descs, descs);
+    std::memcpy(return_buffer, &info, sizeof(info));
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 8) {
+        char line[320];
+        int used = std::snprintf(line, sizeof(line),
+                                 "d3d12_xs: GetResourceAllocationInfo size=%llu align=%llu descs=%u\n",
+                                 static_cast<unsigned long long>(info.SizeInBytes),
+                                 static_cast<unsigned long long>(info.Alignment),
+                                 static_cast<unsigned>(num_resource_descs));
+        write_log(line);
+        if (resource_descs && used > 0) {
+            const D3D12_RESOURCE_DESC& d = resource_descs[0];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs:   desc dim=%u align=%llu w=%llu h=%u depth=%u mips=%u fmt=%u "
+                          "sample=%u/%u layout=%u flags=0x%x\n",
+                          static_cast<unsigned>(d.Dimension),
+                          static_cast<unsigned long long>(d.Alignment),
+                          static_cast<unsigned long long>(d.Width), static_cast<unsigned>(d.Height),
+                          static_cast<unsigned>(d.DepthOrArraySize),
+                          static_cast<unsigned>(d.MipLevels), static_cast<unsigned>(d.Format),
+                          static_cast<unsigned>(d.SampleDesc.Count),
+                          static_cast<unsigned>(d.SampleDesc.Quality),
+                          static_cast<unsigned>(d.Layout), static_cast<unsigned>(d.Flags));
+            write_log(line);
+        }
+    }
+    return return_buffer;
+}
+
 constexpr std::size_t create_root_signature_slot = 16;
+
+// Measured at game RVA 0xabfe07: another console method writes a struct through a caller buffer in
+// RCX and the caller asserts when the high dword of the first field is nonzero. The shim has no
+// implementation, so zero the buffer for the check and log the arguments until the meaning is known.
+constexpr std::size_t slot108_slot = 108;
+
+void* WINAPI slot108_zero_struct(void* return_buffer, ProxyDevice*, std::uintptr_t a,
+                                 std::uintptr_t b, std::uintptr_t c)
+{
+    if (!return_buffer) return nullptr;
+    std::memset(return_buffer, 0, 0x20);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 8) {
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: slot108 zero struct buf=%p a=0x%llx b=0x%llx c=0x%llx\n",
+                      return_buffer, static_cast<unsigned long long>(a),
+                      static_cast<unsigned long long>(b), static_cast<unsigned long long>(c));
+        write_log(line);
+    }
+    return return_buffer;
+}
 
 bool use_root_signature_round_trip();
 HRESULT create_root_signature_round_trip(ProxyDevice* proxy, UINT node_mask, const void* blob,
@@ -2740,6 +2828,10 @@ ProxyDevice* create_proxy(ID3D12Device* real)
         reinterpret_cast<void*>(&create_graphics_pipeline_state);
     proxy->vtable_memory[create_root_signature_slot] =
         reinterpret_cast<void*>(&create_root_signature);
+    proxy->vtable_memory[get_resource_allocation_info_slot] =
+        reinterpret_cast<void*>(&get_resource_allocation_info_x);
+    proxy->vtable_memory[slot108_slot] =
+        reinterpret_cast<void*>(&slot108_zero_struct);
     proxy->vtable_memory[create_descriptor_heap_slot] =
         reinterpret_cast<void*>(&create_descriptor_heap);
     proxy->vtable_memory[create_committed_resource_slot] =
