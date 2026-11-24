@@ -5478,3 +5478,15 @@ shader database or group archive, not the per-file container the loader expects.
 null `im` lookup at `0x3750bc5` only moves the failure to `0x2d41a6`, where a render object calls a
 null slot at `+0x90`. The shader database therefore remains required for startup; no window, frame
 loop or present has been reached.
+
+The package layout is an unpacked MSIX tree: `appxmanifest.xml` names
+`RockstarGamesInc.28872443D20A7` version `1.0.2.1`, the application id `GTAO`, and a
+`Microsoft.GameOs` OS package dependency. The game is launched as a bare executable, so it has no
+package identity and the console package VFS is absent; this matches the missing `platform:` and
+`common:` mounts.
+
+Registering the unpacked layout with `Add-AppxPackage -Register appxmanifest.xml` is refused with
+`0x80073CFF`: the machine has no developer licence and `AllowDevelopmentWithoutDevLicense` /
+`AllowAllTrustedApps` are unset under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock`.
+The current shell is not elevated. Package registration, and therefore native package identity,
+needs Developer Mode or sideloading enabled first; that is a host setting, not a shim change.
