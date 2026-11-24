@@ -8,6 +8,7 @@
 #include <unknwn.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <intrin.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -150,6 +151,15 @@ void format_iid(const GUID& iid, char* out, std::size_t size)
                   iid.Data4[3], iid.Data4[4], iid.Data4[5], iid.Data4[6], iid.Data4[7]);
 }
 
+// RVA of the instruction after the game's call into a shim handler, for bring-up correlation.
+std::uintptr_t caller_rva()
+{
+    const HMODULE game = GetModuleHandleW(nullptr);
+    const auto base = reinterpret_cast<std::uintptr_t>(game);
+    const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    return base && caller >= base ? caller - base : caller;
+}
+
 void destroy_proxy(ProxyDevice* proxy)
 {
     if (proxy->real) proxy->real->Release();
@@ -266,7 +276,7 @@ volatile LONG device_slot_calls[64] = {};
 extern "C" void log_device_slot_call(std::uintptr_t slot)
 {
     if (slot >= 64) return;
-    if (InterlockedIncrement(&device_slot_calls[slot]) > 4) return;
+    if (InterlockedIncrement(&device_slot_calls[slot]) > 64) return;
     char line[128];
     std::snprintf(line, sizeof(line), "d3d12_xs: device slot %llu called\n",
                   static_cast<unsigned long long>(slot));
@@ -376,6 +386,13 @@ constexpr std::size_t command_list_set_pipeline_state_slot = 25;
 constexpr std::size_t command_list_set_compute_root_signature_slot = 29;
 constexpr std::size_t command_list_set_compute_root_uav_slot = 41;
 constexpr std::size_t command_list_set_root_constants_slot = 40;
+constexpr std::size_t command_list_set_compute_root_descriptor_table_slot = 31;
+constexpr std::size_t command_list_set_graphics_root_descriptor_table_slot = 32;
+constexpr std::size_t command_list_set_descriptor_heaps_slot = 28;
+
+// Defined with the descriptor-heap proxy, which appears later in this file. The command-list proxy
+// maps its own heap proxies to the real heaps before binding them.
+ID3D12DescriptorHeap* real_descriptor_heap(void* candidate);
 static_assert(command_list_set_pipeline_state_slot >= command_list_forward_first &&
                   command_list_set_pipeline_state_slot <= command_list_forward_last,
               "SetPipelineState must be inside the forwarded range");
@@ -532,6 +549,9 @@ void WINAPI command_list_set_pipeline_state(XsCommandListProxy* proxy, ID3D12Pip
                       "substituted\n",
                       static_cast<void*>(proxy), static_cast<void*>(pso));
         write_log(line);
+    } else if (proxy->shim_pso_bound && device && device->replacement_root_signature) {
+        real->SetComputeRootSignature(device->replacement_root_signature);
+        proxy->replacement_active = true;
     } else if (proxy->replacement_active) {
         real->SetComputeRootSignature(proxy->requested_root_signature);
         proxy->replacement_active = false;
@@ -631,6 +651,84 @@ void WINAPI command_list_set_root_constants(XsCommandListProxy* proxy, UINT root
     real->SetComputeRoot32BitConstants(root_parameter_index, count, data, dest_offset);
 }
 
+// The title binds descriptor tables with GPU handles from its own console pool. A desktop command
+// list must receive handles into the matching real heap, otherwise the driver reads descriptors from
+// an address that is not a heap and faults. Map a console handle through the per-heap legacy range;
+// the value already inside a real heap is left untouched.
+D3D12_GPU_DESCRIPTOR_HANDLE map_console_gpu_handle(ProxyDevice* device,
+                                                   D3D12_GPU_DESCRIPTOR_HANDLE handle)
+{
+    if (!device || !handle.ptr) return handle;
+    for (std::size_t type = 0; type < 4; ++type) {
+        const ProxyDevice::DescriptorHeapMap& map = device->descriptor_heaps[type];
+        if (map.legacy_base && map.real_gpu && handle.ptr >= map.legacy_base &&
+            handle.ptr < map.legacy_base + map.committed_bytes) {
+            return D3D12_GPU_DESCRIPTOR_HANDLE{map.real_gpu + (handle.ptr - map.legacy_base)};
+        }
+    }
+    return handle;
+}
+
+void WINAPI command_list_set_compute_root_descriptor_table(XsCommandListProxy* proxy,
+                                                           UINT root_parameter_index,
+                                                           D3D12_GPU_DESCRIPTOR_HANDLE handle)
+{
+    const D3D12_GPU_DESCRIPTOR_HANDLE mapped = map_console_gpu_handle(proxy->device_proxy, handle);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 16) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: compute table param=%u gpu=0x%llx -> 0x%llx\n",
+                      static_cast<unsigned>(root_parameter_index),
+                      static_cast<unsigned long long>(handle.ptr),
+                      static_cast<unsigned long long>(mapped.ptr));
+        write_log(line);
+    }
+    static_cast<ID3D12GraphicsCommandList*>(proxy->real_list)
+        ->SetComputeRootDescriptorTable(root_parameter_index, mapped);
+}
+
+void WINAPI command_list_set_graphics_root_descriptor_table(XsCommandListProxy* proxy,
+                                                            UINT root_parameter_index,
+                                                            D3D12_GPU_DESCRIPTOR_HANDLE handle)
+{
+    const D3D12_GPU_DESCRIPTOR_HANDLE mapped = map_console_gpu_handle(proxy->device_proxy, handle);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 16) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: graphics table param=%u gpu=0x%llx -> 0x%llx\n",
+                      static_cast<unsigned>(root_parameter_index),
+                      static_cast<unsigned long long>(handle.ptr),
+                      static_cast<unsigned long long>(mapped.ptr));
+        write_log(line);
+    }
+    static_cast<ID3D12GraphicsCommandList*>(proxy->real_list)
+        ->SetGraphicsRootDescriptorTable(root_parameter_index, mapped);
+}
+
+// Slots 28/31/32 complete the descriptor path. SetDescriptorHeaps binds the title's heap proxies,
+// so translate each to the real heap before the driver sees it.
+void WINAPI command_list_set_descriptor_heaps(XsCommandListProxy* proxy, UINT count,
+                                              ID3D12DescriptorHeap* const* heaps)
+{
+    ID3D12DescriptorHeap* real[16]{};
+    const UINT used = count > 16 ? 16 : count;
+    for (UINT index = 0; index < used; ++index) {
+        real[index] = heaps ? real_descriptor_heap(heaps[index]) : nullptr;
+    }
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 8) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "d3d12_xs: SetDescriptorHeaps count=%u first=%p -> %p\n",
+                      static_cast<unsigned>(count),
+                      static_cast<void*>(heaps && count ? heaps[0] : nullptr),
+                      static_cast<void*>(used ? real[0] : nullptr));
+        write_log(line);
+    }
+    static_cast<ID3D12GraphicsCommandList*>(proxy->real_list)->SetDescriptorHeaps(used, real);
+}
+
 // Slot 9/10: the desktop list must be closed before a queue executes it. Log the first close and
 // reset of every proxy so a missing close shows up in the bring-up log.
 constexpr std::size_t command_list_close_slot = 9;
@@ -724,6 +822,12 @@ XsCommandListProxy* create_command_list_proxy(void* real_list, ProxyDevice* devi
         reinterpret_cast<void*>(&command_list_set_compute_root_uav);
     proxy->vtable_memory[command_list_set_root_constants_slot] =
         reinterpret_cast<void*>(&command_list_set_root_constants);
+    proxy->vtable_memory[command_list_set_compute_root_descriptor_table_slot] =
+        reinterpret_cast<void*>(&command_list_set_compute_root_descriptor_table);
+    proxy->vtable_memory[command_list_set_graphics_root_descriptor_table_slot] =
+        reinterpret_cast<void*>(&command_list_set_graphics_root_descriptor_table);
+    proxy->vtable_memory[command_list_set_descriptor_heaps_slot] =
+        reinterpret_cast<void*>(&command_list_set_descriptor_heaps);
     for (std::size_t slot = command_list_stub_first; slot < command_list_vtable_slots; ++slot) {
         void* stub = cursor;
         cursor = emit_xbox_stub(cursor, slot, reinterpret_cast<const void*>(&command_list_unimplemented));
@@ -858,7 +962,18 @@ struct DescriptorHeapProxy {
     ID3D12DescriptorHeap* real; // +16
     void** vtable_memory;       // +24
     bool use_legacy_base;       // +32 shader-visible pool reports the title's recorded base
+    std::uint64_t magic;        // +40 identifies a proxy when a heap reaches SetDescriptorHeaps
 };
+
+constexpr std::uint64_t descriptor_heap_proxy_magic = 0x5832574845415031ull; // "X2WHEAP1"
+
+ID3D12DescriptorHeap* real_descriptor_heap(void* candidate)
+{
+    if (!candidate) return nullptr;
+    auto* proxy = static_cast<DescriptorHeapProxy*>(candidate);
+    if (proxy->magic == descriptor_heap_proxy_magic) return proxy->real;
+    return static_cast<ID3D12DescriptorHeap*>(candidate);
+}
 
 void destroy_descriptor_heap_proxy(DescriptorHeapProxy* proxy)
 {
@@ -949,6 +1064,7 @@ DescriptorHeapProxy* create_descriptor_heap_proxy(ID3D12DescriptorHeap* real, bo
         proxy->vtable_memory[slot] = reinterpret_cast<void*>(&descriptor_heap_unimplemented);
     }
     proxy->use_legacy_base = use_legacy_base;
+    proxy->magic = descriptor_heap_proxy_magic;
     proxy->vtable_memory[9] = reinterpret_cast<void*>(&descriptor_heap_get_cpu);
     proxy->vtable_memory[10] = reinterpret_cast<void*>(&descriptor_heap_get_gpu);
     return proxy;
@@ -1048,7 +1164,333 @@ HRESULT WINAPI create_command_signature_x(ProxyDevice* proxy,
     return result;
 }
 
+// Desktop slot 24 CopyDescriptorsSimple. The title copies descriptors inside its console pool, so
+// the handles are console addresses, not real-heap handles. Log the arguments (diagnostic) and
+// forward unchanged: the copy itself is CPU memory and the later root-table binding is translated by
+// the command list proxy.
+constexpr std::size_t copy_descriptors_simple_slot = 24;
+
+void WINAPI copy_descriptors_simple(ProxyDevice* proxy, UINT count,
+                                    D3D12_CPU_DESCRIPTOR_HANDLE destination,
+                                    D3D12_CPU_DESCRIPTOR_HANDLE source,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE heap_type)
+{
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 8) {
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CopyDescriptorsSimple count=%u dest=0x%llx src=0x%llx type=%u\n",
+                      static_cast<unsigned>(count),
+                      static_cast<unsigned long long>(destination.ptr),
+                      static_cast<unsigned long long>(source.ptr),
+                      static_cast<unsigned>(heap_type));
+        write_log(line);
+    }
+    if (proxy && proxy->real) {
+        static const bool skip = [] {
+            char value[8]{};
+            const DWORD length = GetEnvironmentVariableA("X2W_SKIP_DESCRIPTOR_COPY", value, sizeof(value));
+            return length > 0 && value[0] == '1';
+        }();
+        if (skip) return;
+        proxy->real->CopyDescriptorsSimple(count, destination, source, heap_type);
+    }
+}
+
+constexpr std::size_t create_root_signature_slot = 16;
+
+bool use_root_signature_round_trip();
+HRESULT create_root_signature_round_trip(ProxyDevice* proxy, UINT node_mask, const void* blob,
+                                         SIZE_T blob_length, REFIID iid, void** root_signature,
+                                         bool* applied);
+extern "C" HRESULT WINAPI d3d12_xs_SerializeVersionedRootSignature(
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* root_signature, ID3DBlob** blob,
+    ID3DBlob** error_blob);
+
+// Bring-up switch: round-trip a serialized console root signature through the desktop deserializer
+// and the shim's serializer, which removes the console flag bits before the driver sees the blob.
+bool use_root_signature_round_trip()
+{
+    static const bool enabled = [] {
+        char value[8]{};
+        const DWORD length =
+            GetEnvironmentVariableA("X2W_ROUNDTRIP_ROOT_SIGNATURES", value, sizeof(value));
+        return length == 0 || !(value[0] == '0');
+    }();
+    return enabled;
+}
+
+HRESULT round_trip_root_signature(const void* blob, SIZE_T blob_length, ID3DBlob** clean_blob)
+{
+    *clean_blob = nullptr;
+    ID3D12RootSignatureDeserializer* deserializer = nullptr;
+    HRESULT result = D3D12CreateRootSignatureDeserializer(
+        blob, blob_length, __uuidof(ID3D12RootSignatureDeserializer),
+        reinterpret_cast<void**>(&deserializer));
+    if (FAILED(result) || !deserializer) return result;
+    const D3D12_ROOT_SIGNATURE_DESC* desc = deserializer->GetRootSignatureDesc();
+    D3D12_ROOT_SIGNATURE_DESC adjusted = *desc;
+    {
+        static volatile LONG logged = 0;
+        if (InterlockedIncrement(&logged) <= 32) {
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                          "d3d12_xs: root sig params=%u samplers=%u flags=0x%x\n",
+                          static_cast<unsigned>(adjusted.NumParameters),
+                          static_cast<unsigned>(adjusted.NumStaticSamplers),
+                          static_cast<unsigned>(adjusted.Flags));
+            write_log(line);
+            const UINT shown = adjusted.NumParameters < 6 ? adjusted.NumParameters : 6;
+            for (UINT index = 0; index < shown && adjusted.pParameters; ++index) {
+                const D3D12_ROOT_PARAMETER& parameter = adjusted.pParameters[index];
+                if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                    std::snprintf(line, sizeof(line),
+                                  "d3d12_xs:   param[%u] table vis=%u ranges=%u\n",
+                                  static_cast<unsigned>(index),
+                                  static_cast<unsigned>(parameter.ShaderVisibility),
+                                  static_cast<unsigned>(parameter.DescriptorTable.NumDescriptorRanges));
+                    write_log(line);
+                    const UINT ranges = parameter.DescriptorTable.NumDescriptorRanges < 4
+                                            ? parameter.DescriptorTable.NumDescriptorRanges
+                                            : 4;
+                    for (UINT range = 0; range < ranges; ++range) {
+                        const D3D12_DESCRIPTOR_RANGE& r =
+                            parameter.DescriptorTable.pDescriptorRanges[range];
+                        std::snprintf(line, sizeof(line),
+                                      "d3d12_xs:     range[%u] type=%u num=%u reg=%u space=%u "
+                                      "offset=%u\n",
+                                      static_cast<unsigned>(range),
+                                      static_cast<unsigned>(r.RangeType),
+                                      static_cast<unsigned>(r.NumDescriptors),
+                                      static_cast<unsigned>(r.BaseShaderRegister),
+                                      static_cast<unsigned>(r.RegisterSpace),
+                                      static_cast<unsigned>(r.OffsetInDescriptorsFromTableStart));
+                        write_log(line);
+                    }
+                } else {
+                    std::snprintf(line, sizeof(line),
+                                  "d3d12_xs:   param[%u] type=%u vis=%u reg=%u space=%u\n",
+                                  static_cast<unsigned>(index),
+                                  static_cast<unsigned>(parameter.ParameterType),
+                                  static_cast<unsigned>(parameter.ShaderVisibility),
+                                  static_cast<unsigned>(parameter.Constants.ShaderRegister),
+                                  static_cast<unsigned>(parameter.Constants.RegisterSpace));
+                    write_log(line);
+                }
+            }
+        }
+    }
+    char value[8]{};
+    const bool keep_spaces =
+        GetEnvironmentVariableA("X2W_RS_KEEP_SPACES", value, sizeof(value)) > 0 && value[0] == '1';
+    if (!keep_spaces) {
+        // Console roots place SRVs/UAVs in engine register spaces (measured: a root SRV in space 3).
+        // The desktop driver fails to finalize a signature that uses them: measured nvwgf2umx returns
+        // E_FAIL from DXIL finalization and then faults in its cleanup. The title's compute blobs are
+        // replaced with shim shaders that bind space 0, so deep-copy the parameters and rewrite every
+        // space to 0. X2W_RS_KEEP_SPACES=1 restores the console values for diagnosis.
+        constexpr UINT max_params = 32;
+        constexpr UINT max_ranges_per_table = 8;
+        D3D12_ROOT_PARAMETER parameters[max_params];
+        D3D12_DESCRIPTOR_RANGE ranges[max_params * max_ranges_per_table];
+        const UINT parameter_count = adjusted.NumParameters < max_params ? adjusted.NumParameters : max_params;
+        UINT range_cursor = 0;
+        for (UINT index = 0; index < parameter_count && adjusted.pParameters; ++index) {
+            parameters[index] = adjusted.pParameters[index];
+            if (parameters[index].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                const UINT count = parameters[index].DescriptorTable.NumDescriptorRanges <
+                                           max_ranges_per_table
+                                       ? parameters[index].DescriptorTable.NumDescriptorRanges
+                                       : max_ranges_per_table;
+                parameters[index].DescriptorTable.NumDescriptorRanges = count;
+                parameters[index].DescriptorTable.pDescriptorRanges = &ranges[range_cursor];
+                for (UINT range = 0; range < count; ++range) {
+                    ranges[range_cursor] = adjusted.pParameters[index]
+                                               .DescriptorTable.pDescriptorRanges[range];
+                    ranges[range_cursor].RegisterSpace = 0;
+                    ++range_cursor;
+                }
+            } else {
+                parameters[index].Constants.RegisterSpace = 0;
+            }
+        }
+        adjusted.NumParameters = parameter_count;
+        adjusted.pParameters = parameters;
+    }
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned{};
+    versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+    versioned.Desc_1_0 = adjusted;
+    ID3DBlob* error = nullptr;
+    result = d3d12_xs_SerializeVersionedRootSignature(&versioned, clean_blob, &error);
+    if (error) error->Release();
+    deserializer->Release();
+    return result;
+}
+
+// Desktop slot 16 CreateRootSignature. The title passes pre-serialized console root signatures; log
+// the blob shape and result so a driver-side failure has a named call site.
+HRESULT WINAPI create_root_signature(ProxyDevice* proxy, UINT node_mask, const void* blob,
+                                     SIZE_T blob_length, REFIID iid, void** root_signature)
+{
+    if (!proxy || !proxy->real || !root_signature) return E_POINTER;
+    *root_signature = nullptr;
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 64) {
+        const auto* bytes = static_cast<const unsigned char*>(blob);
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateRootSignature node=%u len=%llu head=%08x caller=+0x%llx\n",
+                      static_cast<unsigned>(node_mask), static_cast<unsigned long long>(blob_length),
+                      bytes && blob_length >= 4
+                          ? (*reinterpret_cast<const std::uint32_t*>(bytes))
+                          : 0u,
+                      static_cast<unsigned long long>(caller_rva()));
+        write_log(line);
+    }
+    if (use_root_signature_round_trip()) {
+        bool applied = false;
+        const HRESULT round_trip =
+            create_root_signature_round_trip(proxy, node_mask, blob, blob_length, iid,
+                                             root_signature, &applied);
+        if (applied) return round_trip;
+    }
+    const HRESULT result =
+        proxy->real->CreateRootSignature(node_mask, blob, blob_length, iid, root_signature);
+    static volatile LONG logged_result = 0;
+    if (InterlockedIncrement(&logged_result) <= 64) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "d3d12_xs: CreateRootSignature -> 0x%08lx\n",
+                      static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
+
+// Serialized console root signatures can carry console-only flag bits that D3D12Core tolerates but
+// the driver's compiler does not (measured: nvwgf2umx DXIL finalization failed and faulted in its
+// cleanup after ~20 such signatures). Re-serialize the descriptor with the console bits removed.
+HRESULT create_root_signature_round_trip(ProxyDevice* proxy, UINT node_mask, const void* blob,
+                                         SIZE_T blob_length, REFIID iid, void** root_signature,
+                                         bool* applied)
+{
+    *applied = false;
+    ID3DBlob* clean = nullptr;
+    const HRESULT round_trip = round_trip_root_signature(blob, blob_length, &clean);
+    if (FAILED(round_trip) || !clean) {
+        static volatile LONG logged_failure = 0;
+        if (InterlockedIncrement(&logged_failure) <= 8) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "d3d12_xs: root signature round-trip failed 0x%08lx\n",
+                          static_cast<unsigned long>(round_trip));
+            write_log(line);
+        }
+        return round_trip;
+    }
+    *applied = true;
+    const HRESULT result = proxy->real->CreateRootSignature(
+        node_mask, clean->GetBufferPointer(), clean->GetBufferSize(), iid, root_signature);
+    clean->Release();
+    static volatile LONG logged_result = 0;
+    if (InterlockedIncrement(&logged_result) <= 32) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateRootSignature round-trip len=%llu -> 0x%08lx\n",
+                      static_cast<unsigned long long>(blob_length), static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
+
+
 constexpr std::size_t create_descriptor_heap_slot = 14;
+constexpr std::size_t create_graphics_pipeline_state_slot = 6;
+
+// Desktop slot 6 CreateGraphicsPipelineState. The title hands the driver console shader blobs; the
+// desktop driver cannot compile them and can fault inside its own compiler. Log the blob shapes and
+// the result so the failing stage is identified before a replacement policy is added.
+HRESULT WINAPI create_graphics_pipeline_state(ProxyDevice* proxy,
+                                              const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                              REFIID iid, void** pipeline_state)
+{
+    if (!proxy || !proxy->real || !desc || !pipeline_state) return E_POINTER;
+    *pipeline_state = nullptr;
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 32) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateGraphicsPipelineState vs=%llu/%08x ps=%llu/%08x ds=%llu "
+                      "root=%p -> call\n",
+                      static_cast<unsigned long long>(desc->VS.BytecodeLength),
+                      desc->VS.pShaderBytecode && desc->VS.BytecodeLength >= 4
+                          ? *static_cast<const std::uint32_t*>(desc->VS.pShaderBytecode)
+                          : 0u,
+                      static_cast<unsigned long long>(desc->PS.BytecodeLength),
+                      desc->PS.pShaderBytecode && desc->PS.BytecodeLength >= 4
+                          ? *static_cast<const std::uint32_t*>(desc->PS.pShaderBytecode)
+                          : 0u,
+                      static_cast<unsigned long long>(desc->DS.BytecodeLength),
+                      static_cast<void*>(desc->pRootSignature));
+        write_log(line);
+    }
+    const HRESULT result = proxy->real->CreateGraphicsPipelineState(desc, iid, pipeline_state);
+    static volatile LONG logged_result = 0;
+    if (InterlockedIncrement(&logged_result) <= 32) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "d3d12_xs: CreateGraphicsPipelineState -> 0x%08lx\n",
+                      static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
+
+// Desktop slots 27 and 39: CreateCommittedResource and CreateQueryHeap. The bring-up routine calls
+// them in pairs before the command lists. Forwarding is correct, but a failure here leaves the title
+// with a null object that the driver dereferences later, so log the result.
+constexpr std::size_t create_committed_resource_slot = 27;
+constexpr std::size_t create_query_heap_slot = 39;
+
+HRESULT WINAPI create_committed_resource(ProxyDevice* proxy,
+                                         const D3D12_HEAP_PROPERTIES* heap_properties,
+                                         D3D12_HEAP_FLAGS heap_flags,
+                                         const D3D12_RESOURCE_DESC* resource_desc,
+                                         D3D12_RESOURCE_STATES initial_state,
+                                         const D3D12_CLEAR_VALUE* clear_value, REFIID iid,
+                                         void** resource)
+{
+    if (!proxy || !proxy->real || !resource_desc || !resource) return E_POINTER;
+    *resource = nullptr;
+    const HRESULT result = proxy->real->CreateCommittedResource(
+        heap_properties, heap_flags, resource_desc, initial_state, clear_value, iid, resource);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 16) {
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "d3d12_xs: CreateCommittedResource dim=%u w=%llu h=%u flags=%u -> 0x%08lx\n",
+                      static_cast<unsigned>(resource_desc->Dimension),
+                      static_cast<unsigned long long>(resource_desc->Width),
+                      static_cast<unsigned>(resource_desc->Height),
+                      static_cast<unsigned>(heap_flags), static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
+
+HRESULT WINAPI create_query_heap(ProxyDevice* proxy, const D3D12_QUERY_HEAP_DESC* desc, REFIID iid,
+                                 void** heap)
+{
+    if (!proxy || !proxy->real || !desc || !heap) return E_POINTER;
+    *heap = nullptr;
+    const HRESULT result = proxy->real->CreateQueryHeap(desc, iid, heap);
+    static volatile LONG logged = 0;
+    if (InterlockedIncrement(&logged) <= 16) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "d3d12_xs: CreateQueryHeap type=%u count=%u node=%u -> 0x%08lx\n",
+                      static_cast<unsigned>(desc->Type), static_cast<unsigned>(desc->Count),
+                      static_cast<unsigned>(desc->NodeMask), static_cast<unsigned long>(result));
+        write_log(line);
+    }
+    return result;
+}
 constexpr UINT desktop_shader_visible_limit = 1'000'000;
 
 // The title caches the console descriptor stride before it builds the view pools. On Scarlett that
@@ -2101,12 +2543,17 @@ HRESULT WINAPI create_compute_pipeline_state_x(
     const auto& shader = noop_compute_shader_blob();
     const bool noop_ready = SUCCEEDED(shader.result) && shader.blob;
 
+    // Every shim PSO is compiled against the shim root signature. The title's own root signature
+    // carries console-only bindings that the desktop driver fails to finalize (measured: nvwgf2umx
+    // DXIL finalization returns E_FAIL and then faults in its cleanup path).
+    const bool shim_root_ready = ensure_replacement_resources(proxy);
+
     const int replacement_index = find_replacement_shader(desc->CS);
     const bool replacement_target = replacement_index >= 0;
     const replacement_shader_cache* replacement = nullptr;
     if (replacement_target) {
         const replacement_shader_cache& cached = replacement_shader_blob(replacement_index);
-        if (cached.bytes && cached.size && ensure_replacement_resources(proxy)) {
+        if (cached.bytes && cached.size && shim_root_ready) {
             replacement = &cached;
         }
     }
@@ -2127,6 +2574,7 @@ HRESULT WINAPI create_compute_pipeline_state_x(
     } else {
         if (replacement_target) source = "noop (replacement unavailable)";
         safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
+        safe.pRootSignature = shim_root_ready ? proxy->replacement_root_signature : nullptr;
     }
 
     HRESULT result = proxy->real->CreateComputePipelineState(&safe, requested, pipeline_state);
@@ -2142,7 +2590,7 @@ HRESULT WINAPI create_compute_pipeline_state_x(
         write_log(line);
         if (!noop_ready) return result;
         uses_replacement = false;
-        safe.pRootSignature = desc->pRootSignature;
+        safe.pRootSignature = shim_root_ready ? proxy->replacement_root_signature : nullptr;
         safe.CS = {shader.blob->GetBufferPointer(), shader.blob->GetBufferSize()};
         source = "noop (replacement create failed)";
         *pipeline_state = nullptr;
@@ -2162,6 +2610,9 @@ HRESULT WINAPI create_compute_pipeline_state_x(
                       *pipeline_state, static_cast<void*>(desc->pRootSignature),
                       static_cast<void*>(proxy->replacement_root_signature));
         write_log(line);
+    } else if (SUCCEEDED(result) && shim_root_ready && *pipeline_state) {
+        // Later SetComputeRootSignature calls with this title root are substituted for the shim root.
+        proxy->replacement_game_root_signature = desc->pRootSignature;
     }
 
     char line[192];
@@ -2223,8 +2674,18 @@ ProxyDevice* create_proxy(ID3D12Device* real)
     proxy->vtable_memory[create_command_queue_x_slot] =
         reinterpret_cast<void*>(&create_command_queue_x);
     proxy->vtable_memory[8] = reinterpret_cast<void*>(&create_command_queue);
+    proxy->vtable_memory[create_graphics_pipeline_state_slot] =
+        reinterpret_cast<void*>(&create_graphics_pipeline_state);
+    proxy->vtable_memory[create_root_signature_slot] =
+        reinterpret_cast<void*>(&create_root_signature);
     proxy->vtable_memory[create_descriptor_heap_slot] =
         reinterpret_cast<void*>(&create_descriptor_heap);
+    proxy->vtable_memory[create_committed_resource_slot] =
+        reinterpret_cast<void*>(&create_committed_resource);
+    proxy->vtable_memory[create_query_heap_slot] =
+        reinterpret_cast<void*>(&create_query_heap);
+    proxy->vtable_memory[copy_descriptors_simple_slot] =
+        reinterpret_cast<void*>(&copy_descriptors_simple);
     proxy->vtable_memory[get_device_removed_reason_slot] =
         reinterpret_cast<void*>(&get_device_removed_reason);
     proxy->vtable_memory[create_command_signature_slot] =
@@ -2335,6 +2796,22 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
     // FL12_0 device rejects their pipeline states with E_INVALIDARG. Prefer the highest feature
     // level the adapter reports and fall back gracefully.
     ID3D12Device* real_device = nullptr;
+    // Bring-up switch: the SDK debug layer forwards every validation message through
+    // OutputDebugString, which the harness records. Off by default because it changes device behaviour.
+    {
+        char enabled[8]{};
+        if (GetEnvironmentVariableA("X2W_D3D12_DEBUG", enabled, sizeof(enabled)) > 0 &&
+            enabled[0] == '1') {
+            ID3D12Debug* debug = nullptr;
+            if (SUCCEEDED(D3D12GetDebugInterface(__uuidof(ID3D12Debug),
+                                                 reinterpret_cast<void**>(&debug))) &&
+                debug) {
+                debug->EnableDebugLayer();
+                debug->Release();
+                write_log("d3d12_xs: D3D12 debug layer enabled\n");
+            }
+        }
+    }
     HRESULT create_hr = E_FAIL;
     D3D_FEATURE_LEVEL created_level = D3D_FEATURE_LEVEL_12_0;
     const D3D_FEATURE_LEVEL levels_to_try[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1,
