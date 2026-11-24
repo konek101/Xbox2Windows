@@ -5386,10 +5386,17 @@ table is written by `0x1e6c313` only when `XMemAllocatePhysicalPages(0x380, …)
 succeeds. Accepting that observed flag (see the physical-page section) makes the
 initializer run and removes the fault.
 
-The run then continues into content loading and stops at a data-validation
-`int3` at game RVA `0x374f2a7`: the surrounding code builds a rolling-byte
-string over a 0x1a-byte buffer and asserts when the checker at `0x2499630`
-returns false. Animation/script names are already present in the adjacent
-buffers. The queue stub answers enqueue/submit without reading files, so this is
-consistent with resource reads returning no data. Implementing the synchronous
-queue reads is the open work; no window, frame loop or present has been reached.
+The run then continues into content loading. Two asserts mark the next gaps.
+First, `0x374f160` decodes and checks the shader-database path
+(`platform:/shaders/v2/fxdb`, measured at `0x374f286`) and asserts at
+`0x374f2a7` when the path does not resolve; the harness currently skips that
+debug-only assert. Second, `0x5c37ee0` instantiates the DirectStorage file
+device through the factory lookup at `0x1adcc20` and asserts at `0x5c382b3`
+when the lookup returns null. A probe after the `lea` shows the shared name
+buffer at `0x9ab39e0` contains `im` (with `platform:/shaders/v2` left in the
+next 0x40-byte slot) at that call, so the factory is asked for a name that is not
+registered. The buffer is a shared scratch array written by the registrar around
+`0x2240da0`; what should fill slot 0 before this call is the open question.
+Implementing the queue reads remains necessary, but no queue method is called
+yet; the current stop is device/class instantiation. No window, frame loop or
+present has been reached.
