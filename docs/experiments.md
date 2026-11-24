@@ -5392,11 +5392,19 @@ First, `0x374f160` decodes and checks the shader-database path
 `0x374f2a7` when the path does not resolve; the harness currently skips that
 debug-only assert. Second, `0x5c37ee0` instantiates the DirectStorage file
 device through the factory lookup at `0x1adcc20` and asserts at `0x5c382b3`
-when the lookup returns null. A probe after the `lea` shows the shared name
-buffer at `0x9ab39e0` contains `im` (with `platform:/shaders/v2` left in the
-next 0x40-byte slot) at that call, so the factory is asked for a name that is not
-registered. The buffer is a shared scratch array written by the registrar around
-`0x2240da0`; what should fill slot 0 before this call is the open question.
+when the lookup returns null.
+
+A PAGE_GUARD watch on the shared name buffer at `0x9ab39e0` (harness-only)
+shows the write comes from the registrar `0x2240da0` at `0x2241074`, through the
+copy routine at `0x4dac927`. The literal is genuinely `im`: MSVC suffix-pooled
+it into the tail of `Prop_Am_CS_Construction_Lift_01a_Anim` at RVA `0x677fb6b`,
+so the pointer is not a truncated copy. The factory miss path calls `0x247b530`,
+which checks for a `memory:` prefix at `0x5cabbe0` and otherwise treats the name
+as a file path; opening `im` fails, the instance is null, and the debug assert
+fires. The hash map is filled lazily by misses (a failed lookup inserts an entry
+with value zero), so the empty table at the device call is consistent with the
+first lookup for this name.
+
 Implementing the queue reads remains necessary, but no queue method is called
-yet; the current stop is device/class instantiation. No window, frame loop or
-present has been reached.
+yet; the current stop is device/class instantiation and the unresolved
+`platform:` mount. No window, frame loop or present has been reached.
