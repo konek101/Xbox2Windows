@@ -160,6 +160,68 @@ std::uintptr_t caller_rva()
     return base && caller >= base ? caller - base : caller;
 }
 
+// X2W_FAULT_TRACE=1: write a real unwind of the faulting stack before the process dies. The harness
+// only sees heuristic stack words, which did not include game frames for the ucrtbased fault.
+void log_fault_stack(CONTEXT* context)
+{
+    CONTEXT walk = *context;
+    char line[256];
+    for (int frame = 0; frame < 24 && walk.Rip; ++frame) {
+        PVOID image_base = nullptr;
+        DWORD64 lookup_base = 0;
+        RtlPcToFileHeader(reinterpret_cast<PVOID>(walk.Rip), &image_base);
+        const auto base = reinterpret_cast<std::uintptr_t>(image_base);
+        const unsigned long long offset =
+            base ? static_cast<unsigned long long>(walk.Rip - base)
+                 : static_cast<unsigned long long>(walk.Rip);
+        std::snprintf(line, sizeof(line), "d3d12_xs: fault frame %02d 0x%llx base=0x%llx",
+                      frame, offset, static_cast<unsigned long long>(base));
+        write_log(line);
+        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(walk.Rip, &lookup_base, nullptr);
+        if (!entry) {
+            const auto* stack = reinterpret_cast<const std::uintptr_t*>(walk.Rsp);
+            if (!stack) break;
+            walk.Rip = *stack;
+            walk.Rsp += sizeof(std::uintptr_t);
+        } else {
+            PVOID handler_data = nullptr;
+            DWORD64 establisher_frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER,
+                             static_cast<DWORD64>(base ? base : lookup_base), walk.Rip, entry,
+                             &walk, &handler_data, &establisher_frame, nullptr);
+        }
+    }
+}
+
+LONG CALLBACK fault_trace_handler(EXCEPTION_POINTERS* info)
+{
+    if (!info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char line[192];
+    std::snprintf(line, sizeof(line), "d3d12_xs: fault code=0x%08lx at 0x%llx\n",
+                  static_cast<unsigned long>(code),
+                  static_cast<unsigned long long>(info->ContextRecord->Rip));
+    write_log(line);
+    log_fault_stack(info->ContextRecord);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ensure_fault_trace()
+{
+    static const bool installed = [] {
+        char value[8]{};
+        const DWORD length = GetEnvironmentVariableA("X2W_FAULT_TRACE", value, sizeof(value));
+        if (length == 0 || value[0] != '1') return false;
+        AddVectoredExceptionHandler(1, &fault_trace_handler);
+        write_log("d3d12_xs: fault tracer installed\n");
+        return true;
+    }();
+    (void)installed;
+}
+
 void destroy_proxy(ProxyDevice* proxy)
 {
     if (proxy->real) proxy->real->Release();
@@ -2772,7 +2834,7 @@ extern "C" HRESULT WINAPI d3d12_xs_XboxCreateDevice(
 {
     if (!device) return E_POINTER;
     *device = nullptr;
-
+    ensure_fault_trace();
     char iid_text[64];
     format_iid(requested_iid, iid_text, sizeof(iid_text));
     char line[256];

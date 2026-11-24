@@ -60,6 +60,9 @@ struct factory_object {
     void** vtable;
 };
 
+struct status_array_object;
+status_array_object& status_array();
+
 HRESULT STDMETHODCALLTYPE factory_query_interface(factory_object* self, const GUID* interface_id,
                                                   void** out)
 {
@@ -94,8 +97,9 @@ HRESULT STDMETHODCALLTYPE factory_create_status_array(factory_object*, std::uint
 {
     log_line(L"factory CreateStatusArray capacity=%lu name=%p", capacity, name);
     log_guid(L"factory CreateStatusArray iid", interface_id);
-    if (out) *out = nullptr;
-    return not_implemented;
+    if (out == nullptr) return E_POINTER;
+    *out = &status_array();
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE factory_open_file(factory_object*, const wchar_t* path,
@@ -135,6 +139,78 @@ HRESULT STDMETHODCALLTYPE factory_unknown_slot(void*, std::uint64_t a, std::uint
     return not_implemented;
 }
 
+// Minimal IDStorageStatusArray: the measured title creates one status array as part of its
+// DirectStorage device. IsComplete reports true and GetHResult reports S_OK, which matches the
+// synchronous stub queue this shim intends to provide.
+struct status_array_object {
+    void** vtable;
+};
+
+HRESULT STDMETHODCALLTYPE status_query_interface(status_array_object* self, const GUID* interface_id,
+                                                 void** out)
+{
+    log_guid(L"status array QueryInterface iid", interface_id);
+    if (out == nullptr) return E_POINTER;
+    *out = self;
+    return S_OK;
+}
+
+ULONG STDMETHODCALLTYPE status_add_ref(status_array_object*)
+{
+    return 2;
+}
+
+ULONG STDMETHODCALLTYPE status_release(status_array_object*)
+{
+    return 0;
+}
+
+BOOL STDMETHODCALLTYPE status_is_complete(status_array_object*, std::uint32_t index)
+{
+    log_line(L"status array IsComplete index=%lu", index);
+    return TRUE;
+}
+
+HRESULT STDMETHODCALLTYPE status_get_hresult(status_array_object*, std::uint32_t index)
+{
+    log_line(L"status array GetHResult index=%lu", index);
+    return S_OK;
+}
+
+template <std::size_t Slot>
+HRESULT STDMETHODCALLTYPE status_unknown_slot(void*, std::uint64_t, std::uint64_t, std::uint64_t)
+{
+    log_line(L"status array unknown slot=%zu", Slot);
+    return S_OK;
+}
+
+template <std::size_t... I>
+void fill_status_slots(std::array<void*, 16>& table, std::index_sequence<I...>)
+{
+    ((table[5 + I] = reinterpret_cast<void*>(&status_unknown_slot<5 + I>)), ...);
+}
+
+void** status_array_vtable()
+{
+    static std::array<void*, 16> table = [] {
+        std::array<void*, 16> result{};
+        result[0] = reinterpret_cast<void*>(&status_query_interface);
+        result[1] = reinterpret_cast<void*>(&status_add_ref);
+        result[2] = reinterpret_cast<void*>(&status_release);
+        result[3] = reinterpret_cast<void*>(&status_is_complete);
+        result[4] = reinterpret_cast<void*>(&status_get_hresult);
+        fill_status_slots(result, std::make_index_sequence<11>{});
+        return result;
+    }();
+    return table.data();
+}
+
+status_array_object& status_array()
+{
+    static status_array_object object{status_array_vtable()};
+    return object;
+}
+
 template <std::size_t... I>
 void fill_unknown_slots(std::array<void*, 3 + slot_count>& table, std::index_sequence<I...>)
 {
@@ -149,8 +225,8 @@ void** factory_vtable()
         result[1] = reinterpret_cast<void*>(&factory_add_ref);
         result[2] = reinterpret_cast<void*>(&factory_release);
         result[3] = reinterpret_cast<void*>(&factory_create_queue);
-        result[4] = reinterpret_cast<void*>(&factory_create_status_array);
-        result[5] = reinterpret_cast<void*>(&factory_open_file);
+        result[4] = reinterpret_cast<void*>(&factory_open_file);
+        result[5] = reinterpret_cast<void*>(&factory_create_status_array);
         result[6] = reinterpret_cast<void*>(&factory_set_cpu_affinity);
         result[7] = reinterpret_cast<void*>(&factory_set_debug_flags);
         result[8] = reinterpret_cast<void*>(&factory_set_staging_buffer_size);
@@ -171,6 +247,10 @@ extern "C" HRESULT WINAPI DStorageGetFactory(const GUID* interface_id, void** ou
 {
     log_guid(L"factory requested iid", interface_id);
     if (out == nullptr) return E_POINTER;
+    // The measured title asks for {62959d11-d45f-4884-a0a3-f7862ea243ae} and then calls slot 5 with
+    // a record-like argument list (1, "fiDeviceDirectStorage", payload, out). That is not this
+    // factory's OpenFile layout, so answering S_OK for an unknown interface hands the title the wrong
+    // vtable. Log and fail the request instead of returning this object for every IID.
     *out = &factory();
     return S_OK;
 }
