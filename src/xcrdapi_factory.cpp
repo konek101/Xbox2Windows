@@ -17,11 +17,22 @@
 #include <cstdint>
 #include <cwchar>
 #include <cstring>
+#include <intrin.h>
 #include <utility>
 
 namespace {
 constexpr HRESULT not_implemented = static_cast<HRESULT>(0x80004001u);
 constexpr std::size_t slot_count = 62;
+
+bool caller_trace()
+{
+    static const bool enabled = [] {
+        wchar_t value[8]{};
+        DWORD length = GetEnvironmentVariableW(L"XCRD_TRACE_CALLER", value, 8);
+        return length == 1 && value[0] == L'1';
+    }();
+    return enabled;
+}
 
 void log_line(const wchar_t* format, ...)
 {
@@ -57,6 +68,14 @@ void log_guid(const wchar_t* label, const GUID* id)
              id->Data4[5], id->Data4[6], id->Data4[7]);
 }
 
+void log_caller(const wchar_t* label, void* caller)
+{
+    if (!caller_trace()) return;
+    static LONG sequence = 0;
+    LONG index = InterlockedIncrement(&sequence);
+    if (index <= 64) log_line(L"%s caller=%p seq=%ld", label, caller, index);
+}
+
 struct factory_object {
     void** vtable;
 };
@@ -89,6 +108,7 @@ HRESULT STDMETHODCALLTYPE factory_create_queue(factory_object*, const void* desc
                                                const GUID* interface_id, void** out)
 {
     log_line(L"factory CreateQueue description=%p", description);
+    log_caller(L"factory CreateQueue", _ReturnAddress());
     log_guid(L"factory CreateQueue iid", interface_id);
     // Console queue descriptor (XCL reference): source type u32 at 0, capacity u16 at 8,
     // priority i8 at 0xa, name pointer at 0x10. The newer create path passes an extra qword at 0x18.
@@ -115,6 +135,7 @@ HRESULT STDMETHODCALLTYPE factory_create_status_array(factory_object*, std::uint
                                                      void** out)
 {
     log_line(L"factory CreateStatusArray capacity=%lu name=%p", capacity, name);
+    log_caller(L"factory CreateStatusArray", _ReturnAddress());
     log_guid(L"factory CreateStatusArray iid", interface_id);
     if (out == nullptr) return E_POINTER;
     *out = &status_array();

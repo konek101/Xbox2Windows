@@ -5459,3 +5459,22 @@ through `0x1972c90`; that returns 0 because no `platform:` device is registered.
 factory workaround therefore only moves startup to the same console VFS gap: without a platform
 mount (or the engine's RPF packfile device) the file device cannot be created and the run faults at
 `0x3750bd4`. No window, frame loop or present is reached.
+
+The desktop DirectStorage factory is exercised during startup. A caller trace (`XCRD_TRACE_CALLER=1`)
+shows `factory CreateStatusArray` and `factory CreateQueue` arriving from `0x28c9526` and
+`0x28c95ca`, inside the device constructor `0x28c9460`. The constructor builds a 16-entry device
+pool; about 18 constructor calls occur per run and every call returns a non-null queue object.
+
+The unresolved layer is the package VFS. Every `platform:/...` and `common:/...` open resolves
+through `0x1972d70` to the default device and returns `-1`; only `memory:$<address>,<size>,0:` opens
+succeed. The shader database requests `platform:/shaders/v2/fxdb/sga_xbsx_final_init.fxdb` and
+`platform:/shaders/v2/fxdb/sga_xbsx_final.fxdb` are rejected before DirectStorage `OpenFile` is
+called, so the engine never reads a `.rpf` through DirectStorage.
+
+Serving the two `SGD5` blocks at `shaders.rpf +0x9000` and `+0x10287000` through the memory device
+does not satisfy the loader `0x2499630`: that loader first reads a four-byte magic, eight bytes, a
+zero u32 and a size, while the blocks carry a non-zero entry count at `+0x0c`. The blocks are the
+shader database or group archive, not the per-file container the loader expects. Bypassing the
+null `im` lookup at `0x3750bc5` only moves the failure to `0x2d41a6`, where a render object calls a
+null slot at `+0x90`. The shader database therefore remains required for startup; no window, frame
+loop or present has been reached.
