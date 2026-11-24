@@ -87,8 +87,8 @@ extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)
     return era_query::query(process, address, buffer, query_buffer_bytes) != 0;
 }
 
-// Desktop policy (docs/experiments.md): writes only +8, with this process's GPU memory in bytes;
-// on failure the output is untouched and the callers use zero.
+// Desktop policy (docs/experiments.md): writes +0 (budget) and +8 (this process's GPU memory in
+// bytes); on failure the output is untouched and the callers use zero.
 extern "C" BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics)
 {
     if (!statistics) {
@@ -101,6 +101,13 @@ extern "C" BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics)
         return FALSE;
     }
     std::memcpy(static_cast<unsigned char*>(statistics) + gpu_usage_offset, &*bytes, sizeof(*bytes));
+    // The title's startup budget check reads a second 64-bit value at +0 and requires
+    // (value at +0) - (value at +8) >= 0x6400001 before it continues (game RVA 0x2474553..0x2474560).
+    // Desktop has no console budget concept, so publish a budget that is the current usage plus a
+    // fixed headroom. Without it the difference is negative and startup fail-fasts.
+    constexpr std::uint64_t budget_headroom = 0x10000000ull; // 256 MiB
+    const std::uint64_t budget = *bytes + budget_headroom;
+    std::memcpy(static_cast<unsigned char*>(statistics), &budget, sizeof(budget));
     return TRUE;
 }
 

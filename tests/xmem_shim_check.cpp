@@ -293,15 +293,20 @@ std::uint64_t caller_reads()
 
 bool working_set_checks()
 {
-    // The AMD selector succeeds and writes only the qword at +8.
+    // The AMD selector succeeds: +0 is a budget, +8 is current usage, everything else untouched.
     Statistics statistics;
     statistics.fill(sentinel);
     const BOOL ok = XMemGetWorkingSetStatistics(amd_selector, statistics.data());
+    const std::uint64_t budget = statistics[0];
+    const std::uint64_t usage = statistics[1];
+    statistics[0] = sentinel;
     statistics[1] = sentinel;
     const auto untouched = [&] {
         return std::all_of(statistics.begin(), statistics.end(), [](std::uint64_t v) { return v == sentinel; });
     };
     const bool rest_untouched = untouched();
+    // The title requires budget - usage >= 0x6400001 before it continues startup.
+    const bool budget_ok = budget > usage && budget - usage >= 0x6400001ull;
 
     // Another selector stays unsupported and leaves the output untouched.
     SetLastError(ERROR_SUCCESS);
@@ -310,10 +315,12 @@ bool working_set_checks()
     SetLastError(ERROR_SUCCESS);
     const BOOL null_output = XMemGetWorkingSetStatistics(amd_selector, nullptr);
     const DWORD null_error = GetLastError();
-    std::printf("amd_selector=%d rest_untouched=%d other_selector=%d error=%lu null_output=%d error=%lu\n", ok,
-                rest_untouched, other, other_error, null_output, null_error);
-    return ok && rest_untouched && !other && other_error == ERROR_NOT_SUPPORTED && untouched() && !null_output &&
-           null_error == ERROR_INVALID_PARAMETER;
+    std::printf("amd_selector=%d rest_untouched=%d budget=%llu usage=%llu budget_ok=%d other_selector=%d error=%lu "
+                "null_output=%d error=%lu\n",
+                ok, rest_untouched, static_cast<unsigned long long>(budget), static_cast<unsigned long long>(usage),
+                budget_ok, other, other_error, null_output, null_error);
+    return ok && rest_untouched && budget_ok && !other && other_error == ERROR_NOT_SUPPORTED && untouched() &&
+           !null_output && null_error == ERROR_INVALID_PARAMETER;
 }
 
 // Synthetic PnP key query output for adapter_identity::key_length. `written` counts the terminator;
