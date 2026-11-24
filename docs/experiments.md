@@ -5351,3 +5351,39 @@ suite checks forwarded exports and ordinals, missing symbols, forwarder cycles,
 ambiguous local basenames, delay-import reachability, deterministic JSON output,
 path escapes, symlinks, hard-linked outputs and malformed PE CLI rejection. All tests use synthetic
 metadata and fake local files; no title files or binary fixtures are checked in.
+
+## Console DirectStorage factory and queue interface
+
+The Scarlett package imports `DStorageGetFactory` from `xcrdapi.dll` and asks for
+`{62959d11-d45f-4884-a0a3-f7862ea243ae}`. Refusing that IID makes the loader
+break at game RVA `0x1d8e505`; the interface is mandatory for startup. The
+public XCL reference records the console factory order as `CreateQueue`,
+`OpenFile`, `CreateStatusArray`, `SetCpuAffinity`, `SetDebugFlags`,
+`SetStagingBufferSize`; the measured title also calls slot 10 (vtable offset
+`0x50`) with `(descriptor, IID, out)`, and the descriptor fields match the XCL
+queue descriptor: source type `u32` at 0, capacity `u16` at 8, priority `i8` at
+`0xa`, name pointer at `0x10`, then an extra qword at `0x18`.
+
+Measured call sequence on desktop (log at `%TEMP%\xcrdapi-shim.log` when
+`XCRD_LOG` is set):
+
+1. `DStorageGetFactory` with the IID above, then `SetStagingBufferSize 0x2000000`.
+2. `CreateQueue` on slot 10 with the descriptor above and IID
+   `{3c02cb0c-c050-4195-99a1-a1ce94ba33c5}`.
+3. `CreateStatusArray(1, "fiDeviceDirectStorage", {cd66d752-...}, out)` on slot 5.
+
+The shim now returns a minimal status array (`IsComplete` true, `GetHResult`
+`S_OK`) and a queue object whose methods log the request and answer success.
+The request layout follows the XCL reference: options at 0, destination at 8,
+size at `0x18`, source at `0x20`, file offset at `0x28`. No queue method is
+called yet: the title constructs the queue and status array, then continues.
+
+The next measured wall is independent of the request path. The title calls a
+memory-report routine at game RVA `0x374f390`, which calls `0x1962d10` and then
+faults at `0x55aa6f0`, a page-table helper reading the global at `0x71bfcc0`.
+That global is written only by `0x1e6c313` (after a `SetStagingBufferSize`
+call); a breakpoint on `0x1e6c313` never fires before the fault. The desktop
+queue stub therefore satisfies creation but not the staging-memory setup that
+initializes the page table the report path needs. Implementing the synchronous
+queue (file reads through the VFS plus a fence signal) and the staging buffer
+allocation is the open work; no window, frame loop or present has been reached.
