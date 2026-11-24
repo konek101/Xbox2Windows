@@ -142,6 +142,16 @@ extern "C" BOOL WINAPI XMemAllocatePhysicalPages(ULONG_PTR flags, PULONG_PTR cou
         SetLastError(ERROR_SUCCESS);
         return TRUE;
     }
+    // Observed at game RVA 0x1e6c22d: the title asks for the physical pages backing a 64 KiB-page
+    // range with flag value 0x380, an in/out count of (size >> 16) and a page array. Desktop has no
+    // such flag, so treat it as a MEM_64K_PAGES grant; the caller checks that the count is unchanged
+    // and later maps and releases the same array.
+    constexpr ULONG_PTR observed_grant_flags = 0x380;
+    if (flags == observed_grant_flags) {
+        return physical_result(era_physical::allocate(
+            era_physical::mem_64k_pages, reinterpret_cast<std::uint64_t*>(count),
+            reinterpret_cast<std::uint64_t*>(pages)));
+    }
     return physical_result(era_physical::allocate(flags, reinterpret_cast<std::uint64_t*>(count),
                                                   reinterpret_cast<std::uint64_t*>(pages)));
 }

@@ -205,6 +205,16 @@ bool physical_page_checks()
     // Double free: the same arrays again.
     if (!refused_free(4, a) || !refused_free(3, b) || !refused_free(1, c)) return false;
 
+    // Observed grant flag 0x380 (game RVA 0x1e6c22d): the count is unchanged, the array names a
+    // valid grant, and the same array releases through the normal path.
+    Pages observed(4, page_sentinel);
+    ULONG_PTR inout = 4;
+    SetLastError(ERROR_GEN_FAILURE);
+    if (!XMemAllocatePhysicalPages(0x380, &inout, observed.data()) || inout != 4 ||
+        GetLastError() != ERROR_SUCCESS || observed[0] == 0 || observed[0] > page_capacity)
+        return false;
+    if (!freed(observed)) return false;
+
     // Allocation refusals: zero count, null count, null array, unknown flags, MEM_LARGE_PAGES or
     // MEM_PHYSICAL alone, an extra bit and an upper bit, and counts above the capacity.
     Pages untouched(2, page_sentinel);

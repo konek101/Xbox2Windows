@@ -3870,6 +3870,8 @@ The desktop shim exports `XMemAllocDefault(size, attributes)` and `XMemFreeDefau
 
 Refs #880 and #870. With the default allocation pair bound, the startup mapping probe stopped at `XMemAllocatePhysicalPages`. The desktop `xmem.dll` now exports it with `XMemFreePhysicalPages`. Mapping (`XMemMapPhysicalPages`), scatter mapping and transfer are not modeled.
 
+The title's physical-page arena setup calls the pair with its own flag value. At game RVA `0x1e6c22d` it passes flags `0x380`, an in/out count of `(size >> 16)` and an 8-byte-per-page array, then requires the count to come back unchanged. The desktop shim treats `0x380` as a `MEM_64K_PAGES` grant so the same array maps and releases through the normal path. Before this mapping the call returned `FALSE`; the arena's page table at `0x71bfcc0` stayed null and the later memory-report path faulted at `0x55aa6f0`. With the grant accepted the table initializes (game RVA `0x1e6c313`) and that fault no longer occurs.
+
 **Source-built comparison.** `cpu_native_xmem_physical_pair` builds `tests/cpu/xmem_physical_pair.asm` into three x64 EXEs. Each imports the pair by name from `xmem.dll` and `finish_exe` from `cpu_exe_io.dll`, and starts through `exe_startup.asm`. The comparison follows triggered02's independent fixture posted on #880 (Windows loader vs `pe_map`, a canary-filled page array, a missing-provider control). It adds a nonzero success code and mutation variants. The body returns `0x880` when its 10 steps pass, or `0xF00` plus the first failing step:
 
 1. `XMemAllocatePhysicalPages(MEM_64K_PAGES, &count = 2, pages)` returns `TRUE`.
@@ -5378,12 +5380,16 @@ The request layout follows the XCL reference: options at 0, destination at 8,
 size at `0x18`, source at `0x20`, file offset at `0x28`. No queue method is
 called yet: the title constructs the queue and status array, then continues.
 
-The next measured wall is independent of the request path. The title calls a
-memory-report routine at game RVA `0x374f390`, which calls `0x1962d10` and then
-faults at `0x55aa6f0`, a page-table helper reading the global at `0x71bfcc0`.
-That global is written only by `0x1e6c313` (after a `SetStagingBufferSize`
-call); a breakpoint on `0x1e6c313` never fires before the fault. The desktop
-queue stub therefore satisfies creation but not the staging-memory setup that
-initializes the page table the report path needs. Implementing the synchronous
-queue (file reads through the VFS plus a fence signal) and the staging buffer
-allocation is the open work; no window, frame loop or present has been reached.
+The next wall was the page table at `0x71bfcc0`. The memory-report routine at
+game RVA `0x374f390` faulted at `0x55aa6f0` because the table was null; the
+table is written by `0x1e6c313` only when `XMemAllocatePhysicalPages(0x380, …)`
+succeeds. Accepting that observed flag (see the physical-page section) makes the
+initializer run and removes the fault.
+
+The run then continues into content loading and stops at a data-validation
+`int3` at game RVA `0x374f2a7`: the surrounding code builds a rolling-byte
+string over a 0x1a-byte buffer and asserts when the checker at `0x2499630`
+returns false. Animation/script names are already present in the adjacent
+buffers. The queue stub answers enqueue/submit without reading files, so this is
+consistent with resource reads returning no data. Implementing the synchronous
+queue reads is the open work; no window, frame loop or present has been reached.
